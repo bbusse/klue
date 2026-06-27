@@ -1,0 +1,18 @@
+[session]
+name = "klue-test"
+window = "test-win"
+
+[options]
+mouse = true
+
+[[row]]
+height = 5
+command = [
+    "echo pane-0",
+    "echo pane-1",
+]
+
+[[row]]
+command = [
+    "echo pane-2",
+]

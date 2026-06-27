@@ -1,0 +1,600 @@
+#!/usr/bin/env bash
+#
+# klue - Terminal dashboard builder and launcher with optional streaming
+#
+# SPDX-FileCopyrightText: 2026 Björn Busse <bj.rn@baerlin.eu>
+# SPDX-License-Identifier: BSD-3-Clause
+#
+set -euo pipefail
+
+CONFIG=""
+STREAM=false
+STREAM_FPS=2
+STREAM_PORT=5000
+STREAM_FONT="/System/Library/Fonts/Menlo.ttc"
+STREAM_FONTSIZE=14
+
+usage() {
+    cat <<EOF
+Usage: klue [OPTIONS]
+
+Options:
+  --config <path>       Path to TOML config file (required)
+  --stream              Enable MJPEG streaming of the dashboard
+  --stream-fps <N>      Frames per second (default: 2)
+  --stream-port <N>     HTTP port for stream (default: 5000)
+  --stream-font <path>  TTF font for rendering (default: Menlo)
+  --stream-fontsize <N> Font size in px (default: 14)
+  -h, --help            Show this help message
+EOF
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+    -h | --help)
+        usage
+        ;;
+    --config)
+        CONFIG="$2"
+        shift 2
+        ;;
+    --stream)
+        STREAM=true
+        shift
+        ;;
+    --stream-fps)
+        STREAM_FPS="$2"
+        shift 2
+        ;;
+    --stream-port)
+        STREAM_PORT="$2"
+        shift 2
+        ;;
+    --stream-font)
+        STREAM_FONT="$2"
+        shift 2
+        ;;
+    --stream-fontsize)
+        STREAM_FONTSIZE="$2"
+        shift 2
+        ;;
+    *)
+        echo "Error: unknown option '$1'" >&2
+        printf "Run 'klue --help' for usage.\n" >&2
+        exit 1
+        ;;
+    esac
+done
+
+if [[ -z "$CONFIG" ]]; then
+    echo "Error: --config is required" >&2
+    echo "Run 'klue --help' for usage." >&2
+    exit 1
+fi
+
+if [[ ! -f "$CONFIG" ]]; then
+    echo "Error: config file not found: $CONFIG" >&2
+    exit 1
+fi
+
+parse_config() {
+    local config="$1"
+    local session_name="" window_name="" source_file=""
+    local opt_mouse="" opt_border_style="" opt_active_border_style=""
+    local -a rows=()       # heights (empty string = flexible)
+    local -a row_cmds=()   # pipe-separated commands per row
+    local -a row_widths=() # pipe-separated widths per row (0 = auto)
+    local env_prefix=""    # environment variable prefix for commands
+
+    local current_section=""
+    local current_row_height=""
+    local current_row_commands=""
+    local current_row_widths=""
+    local in_command_array=false
+    local in_width_array=false
+    local row_count=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Strip comments and trailing whitespace
+        line="${line%%#*}"
+        line="${line%"${line##*[![:space:]]}"}"
+
+        # Skip empty lines
+        [[ -z "$line" ]] && continue
+
+        # Section headers
+        if [[ "$line" == "[[row]]" ]]; then
+            # Save previous row if any
+            if [[ "$current_section" == "row" ]]; then
+                rows+=("$current_row_height")
+                row_cmds+=("$current_row_commands")
+                row_widths+=("$current_row_widths")
+                ((row_count++))
+            fi
+            current_section="row"
+            current_row_height=""
+            current_row_commands=""
+            current_row_widths=""
+            in_command_array=false
+            in_width_array=false
+            continue
+        elif [[ "$line" == "[session]" ]]; then
+            if [[ "$current_section" == "row" ]]; then
+                rows+=("$current_row_height")
+                row_cmds+=("$current_row_commands")
+                row_widths+=("$current_row_widths")
+                ((row_count++))
+            fi
+            current_section="session"
+            continue
+        elif [[ "$line" == "[env]" ]]; then
+            if [[ "$current_section" == "row" ]]; then
+                rows+=("$current_row_height")
+                row_cmds+=("$current_row_commands")
+                row_widths+=("$current_row_widths")
+                ((row_count++))
+            fi
+            current_section="env"
+            continue
+        elif [[ "$line" == "[options]" ]]; then
+            if [[ "$current_section" == "row" ]]; then
+                rows+=("$current_row_height")
+                row_cmds+=("$current_row_commands")
+                row_widths+=("$current_row_widths")
+                ((row_count++))
+            fi
+            current_section="options"
+            continue
+        fi
+
+        # Handle multi-line command array
+        if [[ "$in_command_array" == true ]]; then
+            if [[ "$line" == "]" ]]; then
+                in_command_array=false
+                continue
+            fi
+            # Extract quoted string value
+            local cmd_val
+            cmd_val=$(echo "$line" | sed -E 's/^[[:space:]]*"(.*)"[,[:space:]]*$/\1/')
+            if [[ -n "$cmd_val" && "$cmd_val" != "$line" ]]; then
+                if [[ -n "$current_row_commands" ]]; then
+                    current_row_commands="${current_row_commands}|${cmd_val}"
+                else
+                    current_row_commands="$cmd_val"
+                fi
+            fi
+            continue
+        fi
+        # Handle multi-line width array
+        if [[ "$in_width_array" == true ]]; then
+            if [[ "$line" == "]" ]]; then
+                in_width_array=false
+                continue
+            fi
+            local w_val
+            w_val=$(echo "$line" | sed -E 's/^[[:space:]]*([0-9]+),?[[:space:]]*$/\1/')
+            if [[ -n "$w_val" && "$w_val" != "$line" ]]; then
+                if [[ -n "$current_row_widths" ]]; then
+                    current_row_widths="${current_row_widths}|${w_val}"
+                else
+                    current_row_widths="$w_val"
+                fi
+            fi
+            continue
+        fi
+        # Key = value parsing
+        local key val
+        key=$(echo "$line" | sed -E 's/^[[:space:]]*([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*=.*/\1/')
+        val=$(echo "$line" | sed -E 's/^[^=]*=[[:space:]]*//')
+
+        # Strip quotes from val
+        val="${val%\"}"
+        val="${val#\"}"
+
+        case "$current_section" in
+        session)
+            case "$key" in
+            name) session_name="$val" ;;
+            window) window_name="$val" ;;
+            source) source_file="$val" ;;
+            esac
+            ;;
+        env)
+            # Build environment prefix: export KEY1=value1; export KEY2=value2; ...
+            if [[ -n "$key" && -n "$val" ]]; then
+                if [[ -n "$env_prefix" ]]; then
+                    env_prefix="${env_prefix}; export ${key}='${val}'"
+                else
+                    env_prefix="export ${key}='${val}'"
+                fi
+            fi
+            ;;
+        options)
+            case "$key" in
+            mouse) opt_mouse="$val" ;;
+            pane_border_style) opt_border_style="$val" ;;
+            pane_active_border_style) opt_active_border_style="$val" ;;
+            esac
+            ;;
+        row)
+            case "$key" in
+            height) current_row_height="$val" ;;
+            command)
+                if [[ "$val" == "[" ]]; then
+                    in_command_array=true
+                fi
+                ;;
+            width)
+                if [[ "$val" == "[" ]]; then
+                    in_width_array=true
+                else
+                    # Inline array: width = [30, 0, 0]
+                    local inline_w
+                    inline_w=$(echo "$val" | sed -E 's/^\[//;s/\]$//;s/[[:space:]]*,[[:space:]]*/|/g')
+                    current_row_widths="$inline_w"
+                fi
+                ;;
+            esac
+            ;;
+        esac
+    done <"$config"
+
+    # Save last row
+    if [[ "$current_section" == "row" ]]; then
+        rows+=("$current_row_height")
+        row_cmds+=("$current_row_commands")
+        row_widths+=("$current_row_widths")
+        ((row_count++))
+    fi
+
+    # Set global variables directly
+    _SESSION_NAME="$session_name"
+    _WINDOW_NAME="$window_name"
+    _SOURCE_FILE="$source_file"
+    _ENV_PREFIX="$env_prefix"
+    _OPT_MOUSE="$opt_mouse"
+    _OPT_BORDER_STYLE="$opt_border_style"
+    _OPT_ACTIVE_BORDER_STYLE="$opt_active_border_style"
+    _ROW_COUNT="$row_count"
+    _ROW_HEIGHTS=("${rows[@]}")
+    _ROW_CMDS=("${row_cmds[@]}")
+    _ROW_WIDTHS=("${row_widths[@]}")
+}
+
+# Parse config
+parse_config "$CONFIG"
+
+# Source helper scripts
+if [[ -n "${_SOURCE_FILE:-}" && -f "$_SOURCE_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$_SOURCE_FILE"
+fi
+
+SESSION="${_SESSION_NAME:-klue}"
+WINDOW="${_WINDOW_NAME:-dashboard}"
+ROW_COUNT="${_ROW_COUNT}"
+
+if [[ "$STREAM" == true ]] && tmux has-session -t "$SESSION" 2>/dev/null; then
+    # Jump directly to streaming section below
+    :
+else
+
+    # Create tmux session
+    tmux kill-window -t "$SESSION:$WINDOW" 2>/dev/null || true
+    tmux new-session -A -s "$SESSION" -d -n "$WINDOW"
+
+    # Match window size to current terminal
+    # If all rows have explicit heights, force exact total height so tmux
+    # doesn't distribute surplus lines to an arbitrary row
+    term_cols=${COLUMNS:-$(tput cols)}
+    term_lines=${LINES:-$(tput lines)}
+    # Calculate minimum height needed from row heights
+    # Pane separators are between rows, so there are ROW_COUNT-1 separator lines
+    min_height=0
+    flexible_rows=0
+    for ((r = 0; r < ROW_COUNT; r++)); do
+        h="${_ROW_HEIGHTS[$r]}"
+        if [[ -n "$h" ]]; then
+            min_height=$((min_height + h))
+        else
+            ((flexible_rows++))
+            min_height=$((min_height + 5))
+        fi
+    done
+    if ((ROW_COUNT > 1)); then
+        min_height=$((min_height + ROW_COUNT - 1))
+    fi
+    if ((flexible_rows == 0)); then
+        term_lines=$min_height
+    elif ((term_lines < min_height)); then
+        term_lines=$min_height
+    fi
+    tmux resize-window -t "$SESSION:$WINDOW" -x "$term_cols" -y "$term_lines"
+
+    # Apply options
+    if [[ -n "${_OPT_BORDER_STYLE:-}" ]]; then
+        tmux set-option -t "$SESSION" pane-border-style "$_OPT_BORDER_STYLE"
+    fi
+    if [[ -n "${_OPT_ACTIVE_BORDER_STYLE:-}" ]]; then
+        tmux set-option -t "$SESSION" pane-active-border-style "$_OPT_ACTIVE_BORDER_STYLE"
+    fi
+    if tmux show-options -g pane-border-chars >/dev/null 2>&1; then
+        tmux set-option -t "$SESSION" pane-border-chars "        "
+    fi
+    if [[ "${_OPT_MOUSE:-}" == "true" ]]; then
+        tmux set-option -t "$SESSION" mouse on
+    fi
+
+    # Build layout: create rows (vertical splits), then panes within rows (horizontal)
+    # Get the initial pane
+    declare -a row_panes=()
+    first_pane=$(tmux display-message -t "$SESSION:$WINDOW" -p '#{pane_id}')
+    row_panes+=("$first_pane")
+
+    # Create additional rows by splitting vertically from the bottom
+    for ((r = 1; r < ROW_COUNT; r++)); do
+        new_pane=$(tmux split-window -t "${row_panes[$((r - 1))]}" -v -P -F '#{pane_id}')
+        row_panes+=("$new_pane")
+    done
+
+    # Resize rows with fixed heights (top to bottom)
+    for ((r = 0; r < ROW_COUNT; r++)); do
+        height="${_ROW_HEIGHTS[$r]}"
+        if [[ -n "$height" ]]; then
+            tmux resize-pane -t "${row_panes[$r]}" -y "$height"
+        fi
+    done
+
+    # Split each row horizontally and send commands
+    declare -a all_row_pane_ids=() # pipe-separated pane IDs per row
+    for ((r = 0; r < ROW_COUNT; r++)); do
+        cmds_str="${_ROW_CMDS[$r]}"
+
+        # Split commands by pipe separator
+        IFS='|' read -ra cmds <<<"$cmds_str"
+        local_pane_count=${#cmds[@]}
+
+        if ((local_pane_count == 0)); then
+            all_row_pane_ids+=("")
+            continue
+        fi
+
+        # First command goes to the row's initial pane
+        declare -a pane_ids=()
+        pane_ids=("${row_panes[$r]}")
+
+        # Create additional horizontal panes by splitting the last created pane
+        for ((p = 1; p < local_pane_count; p++)); do
+            remaining=$((local_pane_count - p))
+            pct=$((100 * remaining / (remaining + 1)))
+            new_h_pane=$(tmux split-window -t "${pane_ids[$((p - 1))]}" -h -p "$pct" -P -F '#{pane_id}')
+            pane_ids+=("$new_h_pane")
+        done
+
+        # Store pane IDs for final width pass
+        all_row_pane_ids+=("$(
+            IFS='|'
+            echo "${pane_ids[*]}"
+        )")
+
+        # Apply explicit widths
+        widths_str="${_ROW_WIDTHS[$r]:-}"
+        if [[ -n "$widths_str" ]]; then
+            IFS='|' read -ra widths <<<"$widths_str"
+            for ((p = 0; p < local_pane_count; p++)); do
+                w="${widths[$p]:-0}"
+                if ((w > 0)); then
+                    tmux resize-pane -t "${pane_ids[$p]}" -x "$w"
+                fi
+            done
+        fi
+
+        # Send commands to panes (wait briefly for shell to initialize)
+        sleep 0.1
+        for ((p = 0; p < local_pane_count; p++)); do
+            cmd="${cmds[$p]}"
+            if [[ -n "$cmd" ]]; then
+                # Prepend environment variables if configured
+                if [[ -n "${_ENV_PREFIX:-}" ]]; then
+                    cmd="${_ENV_PREFIX}; ${cmd}"
+                fi
+                tmux send-keys -t "${pane_ids[$p]}" -l "$cmd"
+                tmux send-keys -t "${pane_ids[$p]}" Enter
+            fi
+        done
+    done
+
+    # Final resize pass (enforce heights after all splits are done)
+    for ((r = 0; r < ROW_COUNT; r++)); do
+        height="${_ROW_HEIGHTS[$r]}"
+        if [[ -n "$height" ]]; then
+            tmux resize-pane -t "${row_panes[$r]}" -y "$height"
+        fi
+    done
+
+    # Final width pass (enforce explicit widths after height adjustments)
+    for ((r = 0; r < ROW_COUNT; r++)); do
+        widths_str="${_ROW_WIDTHS[$r]:-}"
+        if [[ -n "$widths_str" ]]; then
+            IFS='|' read -ra widths <<<"$widths_str"
+            IFS='|' read -ra final_pane_ids <<<"${all_row_pane_ids[$r]}"
+            for ((p = 0; p < ${#final_pane_ids[@]}; p++)); do
+                w="${widths[$p]:-0}"
+                if ((w > 0)); then
+                    tmux resize-pane -t "${final_pane_ids[$p]}" -x "$w"
+                fi
+            done
+        fi
+    done
+
+    # Disable active pane highlighting — no pane gets visual focus
+    tmux set-option -t "$SESSION" pane-border-indicators off 2>/dev/null || true
+    tmux set-option -t "$SESSION" pane-border-status off 2>/dev/null || true
+    tmux set-option -t "$SESSION" pane-border-format "" 2>/dev/null || true
+    # Prevent mouse wheel from entering copy-mode (avoids [0/0] indicator)
+    tmux unbind -T root WheelUpPane 2>/dev/null || true
+    tmux unbind -T root WheelDownPane 2>/dev/null || true
+
+fi # End of layout creation (skipped when --stream on existing session)
+
+# Stream mode: render panes to PNG frames, pipe to GStreamer
+if [[ "$STREAM" == true ]]; then
+    TEXTIMG="$(go env GOPATH 2>/dev/null)/bin/textimg"
+    if [[ ! -x "$TEXTIMG" ]]; then
+        # Also check PATH (e.g. in containers)
+        TEXTIMG="$(command -v textimg 2>/dev/null || true)"
+    fi
+    if [[ ! -x "${TEXTIMG:-}" ]]; then
+        echo "Error: textimg not found. Install with: go install github.com/jiro4989/textimg/v3@latest" >&2
+        exit 1
+    fi
+
+    echo "Streaming $SESSION:$WINDOW at ${STREAM_FPS}fps on port $STREAM_PORT"
+
+    # Determine frame dimensions from first capture
+    FRAME_TMPDIR=$(mktemp -d)
+    trap 'rm -rf "$FRAME_TMPDIR"' EXIT
+
+    # Capture one frame to detect cell size and canvas dimensions
+    tmux capture-pane -t "$SESSION:$WINDOW.0" -p -e |
+        "$TEXTIMG" -f "$STREAM_FONT" -F "$STREAM_FONTSIZE" -o "$FRAME_TMPDIR/probe.png" 2>/dev/null
+
+    read -r WCOLS WROWS <<<"$(tmux list-panes -t "$SESSION:$WINDOW" -F '#{window_width} #{window_height}' | head -1)"
+    read -r P0_W P0_H <<<"$(tmux list-panes -t "$SESSION:$WINDOW" -F '#{pane_width} #{pane_height}' | head -1)"
+
+    PROBE_W=$(python3 -c "from PIL import Image; im=Image.open('$FRAME_TMPDIR/probe.png'); print(im.width)")
+    PROBE_H=$(python3 -c "from PIL import Image; im=Image.open('$FRAME_TMPDIR/probe.png'); print(im.height)")
+    CELL_W=$(python3 -c "print($PROBE_W / $P0_W)")
+    CELL_H=$(python3 -c "print($PROBE_H / $P0_H)")
+    CANVAS_W=$(python3 -c "print(int($WCOLS * $CELL_W))")
+    CANVAS_H=$(python3 -c "print(int($WROWS * $CELL_H))")
+
+    echo "Canvas: ${CANVAS_W}x${CANVAS_H}px (cell: ${CELL_W}x${CELL_H})"
+
+    # MJPEG streaming: render panes → composite → serve as motion JPEG over HTTP
+    LAYOUT_FILE="$FRAME_TMPDIR/layout.txt"
+    tmux list-panes -t "$SESSION:$WINDOW" -F '#{pane_index} #{pane_left} #{pane_top} #{pane_width} #{pane_height}' >"$LAYOUT_FILE"
+
+    echo "Streaming... Press Ctrl+C to stop."
+    echo "Browser: http://localhost:$STREAM_PORT/"
+    echo "ffplay:  ffplay http://localhost:$STREAM_PORT/stream"
+
+    cleanup_stream() {
+        kill "$SERVER_PID" 2>/dev/null
+        rm -rf "$FRAME_TMPDIR"
+        exit 0
+    }
+    trap cleanup_stream INT TERM
+
+    # Start the MJPEG HTTP server (handles rendering + serving)
+    python3 <<PYEOF &
+import http.server, socketserver, threading, time, io, os
+from PIL import Image
+
+TMPDIR = "$FRAME_TMPDIR"
+LAYOUT_FILE = "$LAYOUT_FILE"
+TEXTIMG = "$TEXTIMG"
+FONT = "$STREAM_FONT"
+FONTSIZE = $STREAM_FONTSIZE
+CELL_W = $CELL_W
+CELL_H = $CELL_H
+CANVAS_W = int($CANVAS_W)
+CANVAS_H = int($CANVAS_H)
+FPS = $STREAM_FPS
+SESSION = "$SESSION"
+WINDOW = "$WINDOW"
+
+# Read layout
+panes = []
+with open(LAYOUT_FILE) as f:
+    for line in f:
+        parts = line.strip().split()
+        panes.append((int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])))
+
+# Shared frame buffer
+frame_lock = threading.Lock()
+current_frame = b""
+
+INDEX_HTML = b"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>klue stream</title>
+<style>body{margin:0;background:#000;display:flex;align-items:center;justify-content:center;height:100vh}
+img{max-width:100%;max-height:100vh}</style>
+</head><body>
+<img src="/stream" />
+</body></html>"""
+
+class MJPEGHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/" or self.path == "/index.html":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(INDEX_HTML)
+        elif self.path == "/stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            try:
+                while True:
+                    with frame_lock:
+                        jpg = current_frame
+                    if jpg:
+                        self.wfile.write(b"--frame\r\n")
+                        self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                        self.wfile.write(f"Content-Length: {len(jpg)}\r\n".encode())
+                        self.wfile.write(b"\r\n")
+                        self.wfile.write(jpg)
+                        self.wfile.write(b"\r\n")
+                    time.sleep(1.0 / FPS)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        else:
+            self.send_error(404)
+    def log_message(self, *a): pass
+
+def render_loop():
+    global current_frame
+    while True:
+        # Render each pane
+        for idx, left, top, width, height in panes:
+            cmd = f"tmux capture-pane -t {SESSION}:{WINDOW}.{idx} -p -e | {TEXTIMG} -f '{FONT}' -F {FONTSIZE} -o {TMPDIR}/pane_{idx}.png"
+            os.system(cmd + " 2>/dev/null")
+
+        # Composite
+        canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), (0, 0, 0))
+        for idx, left, top, width, height in panes:
+            path = os.path.join(TMPDIR, f"pane_{idx}.png")
+            if os.path.exists(path):
+                try:
+                    pane_img = Image.open(path).convert("RGB")
+                    canvas.paste(pane_img, (int(left * CELL_W), int(top * CELL_H)))
+                except Exception:
+                    pass
+
+        # Encode as JPEG
+        buf = io.BytesIO()
+        canvas.save(buf, "JPEG", quality=85)
+        with frame_lock:
+            current_frame = buf.getvalue()
+
+        time.sleep(1.0 / FPS)
+
+# Start render thread
+threading.Thread(target=render_loop, daemon=True).start()
+
+# Wait for first frame
+time.sleep(2)
+
+# Start HTTP server
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("0.0.0.0", $STREAM_PORT), MJPEGHandler) as srv:
+    srv.serve_forever()
+PYEOF
+    SERVER_PID=$!
+    wait "$SERVER_PID"
+fi
+
+# Attach to the session
+tmux new-session -A -s "$SESSION"
