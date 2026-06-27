@@ -8,6 +8,70 @@
 KLUE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/klue"
 TEST_CONFIG="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test_config.toml"
 TEST_SESSION="klue-test"
+TEST_WINDOW="test-win"
+
+wait_for_session() {
+    local timeout_secs="${1:-12}"
+    local deadline=$((SECONDS + timeout_secs))
+
+    while ((SECONDS < deadline)); do
+        if tmux has-session -t "$TEST_SESSION" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
+wait_for_pane_count() {
+    local expected="$1"
+    local timeout_secs="${2:-12}"
+    local deadline=$((SECONDS + timeout_secs))
+
+    while ((SECONDS < deadline)); do
+        local count
+        count=$(tmux list-panes -t "$TEST_SESSION:$TEST_WINDOW" 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "$count" == "$expected" ]]; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
+wait_for_http_200() {
+    local timeout_secs="${1:-15}"
+    local deadline=$((SECONDS + timeout_secs))
+
+    while ((SECONDS < deadline)); do
+        local code
+        code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5999/ || true)
+        if [[ "$code" == "200" ]]; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+run_klue_bg() {
+    local -a args=("$@")
+
+    if command -v script >/dev/null 2>&1; then
+        local cmd
+        cmd="bash $(printf '%q' "$KLUE")"
+        for arg in "${args[@]}"; do
+            cmd+=" $(printf '%q' "$arg")"
+        done
+        TERM="${TERM:-xterm-256color}" COLUMNS="${COLUMNS:-120}" LINES="${LINES:-40}" \
+            script -qefc "$cmd" /dev/null &
+    else
+        TERM="${TERM:-xterm-256color}" COLUMNS="${COLUMNS:-120}" LINES="${LINES:-40}" \
+            bash "$KLUE" "${args[@]}" &
+    fi
+
+    echo $!
+}
 
 setup_suite() {
     # Kill any leftover test session
@@ -48,11 +112,10 @@ test_unknown_option_fails() {
 
 # Session startup
 test_session_startup() {
-    bash "$KLUE" --config "$TEST_CONFIG" &
-    local pid=$!
-    sleep 3
+    local pid
+    pid=$(run_klue_bg --config "$TEST_CONFIG")
 
-    assert "tmux has-session -t '$TEST_SESSION'" \
+    assert "wait_for_session 12" \
         "tmux session '$TEST_SESSION' should exist after startup"
 
     # Check window name
@@ -61,8 +124,9 @@ test_session_startup() {
     assert_equals "test-win" "$window" "window name should match config"
 
     # Check panes exist (config has 2 rows: 2 panes + 1 pane = 3 total)
+    assert "wait_for_pane_count 3 12" "should have 3 panes"
     local pane_count
-    pane_count=$(tmux list-panes -t "$TEST_SESSION:test-win" | wc -l | tr -d ' ')
+    pane_count=$(tmux list-panes -t "$TEST_SESSION:$TEST_WINDOW" | wc -l | tr -d ' ')
     assert_equals "3" "$pane_count" "should have 3 panes"
 
     kill "$pid" 2>/dev/null
@@ -72,16 +136,17 @@ test_session_startup() {
 # Re-attachment (session already exists)
 test_reattachment_does_not_destroy_session() {
     # Start session first time
-    bash "$KLUE" --config "$TEST_CONFIG" &
-    local pid1=$!
-    sleep 3
+    local pid1
+    pid1=$(run_klue_bg --config "$TEST_CONFIG")
+    assert "wait_for_session 12" "session should be created on first run"
+    assert "wait_for_pane_count 3 12" "first run should create 3 panes"
     kill "$pid1" 2>/dev/null
     wait "$pid1" 2>/dev/null || true
 
     # Run klue again (should re-attach, not kill session)
-    bash "$KLUE" --config "$TEST_CONFIG" &
-    local pid2=$!
-    sleep 2
+    local pid2
+    pid2=$(run_klue_bg --config "$TEST_CONFIG")
+    assert "wait_for_session 12" "session should still exist on second run"
     kill "$pid2" 2>/dev/null
     wait "$pid2" 2>/dev/null || true
 
@@ -92,16 +157,17 @@ test_reattachment_does_not_destroy_session() {
 # Streaming
 test_stream_starts_http_server() {
     # Create session first
-    bash "$KLUE" --config "$TEST_CONFIG" &
-    local pid1=$!
-    sleep 3
+    local pid1
+    pid1=$(run_klue_bg --config "$TEST_CONFIG")
+    assert "wait_for_session 12" "session should exist before stream mode"
+    assert "wait_for_pane_count 3 12" "session should have 3 panes before stream mode"
     kill "$pid1" 2>/dev/null
     wait "$pid1" 2>/dev/null || true
 
     # Start streaming on existing session
-    bash "$KLUE" --config "$TEST_CONFIG" --stream --stream-port 5999 --stream-fps 1 &
-    local stream_pid=$!
-    sleep 10
+    local stream_pid
+    stream_pid=$(run_klue_bg --config "$TEST_CONFIG" --stream --stream-port 5999 --stream-fps 1)
+    assert "wait_for_http_200 20" "HTTP server should respond 200 on /"
 
     # Check HTTP server responds
     local http_code
@@ -120,16 +186,17 @@ test_stream_starts_http_server() {
 
 test_stream_serves_valid_jpeg_frames() {
     # Create session first
-    bash "$KLUE" --config "$TEST_CONFIG" &
-    local pid1=$!
-    sleep 3
+    local pid1
+    pid1=$(run_klue_bg --config "$TEST_CONFIG")
+    assert "wait_for_session 12" "session should exist before stream mode"
+    assert "wait_for_pane_count 3 12" "session should have 3 panes before stream mode"
     kill "$pid1" 2>/dev/null
     wait "$pid1" 2>/dev/null || true
 
     # Start streaming
-    bash "$KLUE" --config "$TEST_CONFIG" --stream --stream-port 5999 --stream-fps 1 &
-    local stream_pid=$!
-    sleep 10
+    local stream_pid
+    stream_pid=$(run_klue_bg --config "$TEST_CONFIG" --stream --stream-port 5999 --stream-fps 1)
+    assert "wait_for_http_200 20" "stream endpoint should become available"
 
     # Grab a chunk of the stream
     timeout 3 curl -s http://localhost:5999/stream > /tmp/klue_test_stream.bin 2>/dev/null || true
@@ -152,9 +219,10 @@ test_stream_serves_valid_jpeg_frames() {
 # Re-attachment with stream (session exists, stream mode)
 test_stream_reattaches_to_existing_session() {
     # Create session first time
-    bash "$KLUE" --config "$TEST_CONFIG" &
-    local pid1=$!
-    sleep 3
+    local pid1
+    pid1=$(run_klue_bg --config "$TEST_CONFIG")
+    assert "wait_for_session 12" "session should exist after initial run"
+    assert "wait_for_pane_count 3 12" "initial run should create 3 panes"
     kill "$pid1" 2>/dev/null
     wait "$pid1" 2>/dev/null || true
 
@@ -162,13 +230,14 @@ test_stream_reattaches_to_existing_session() {
     assert "tmux has-session -t '$TEST_SESSION'" "session should exist"
 
     # Start stream (should skip layout creation, just stream)
-    bash "$KLUE" --config "$TEST_CONFIG" --stream --stream-port 5999 --stream-fps 1 &
-    local stream_pid=$!
-    sleep 10
+    local stream_pid
+    stream_pid=$(run_klue_bg --config "$TEST_CONFIG" --stream --stream-port 5999 --stream-fps 1)
+    assert "wait_for_http_200 20" "stream should start on existing session"
 
     # Session should still exist with same pane count
+    assert "wait_for_pane_count 3 12" "pane count should be preserved after stream re-attach"
     local pane_count
-    pane_count=$(tmux list-panes -t "$TEST_SESSION:test-win" | wc -l | tr -d ' ')
+    pane_count=$(tmux list-panes -t "$TEST_SESSION:$TEST_WINDOW" | wc -l | tr -d ' ')
     assert_equals "3" "$pane_count" \
         "pane count should be preserved after stream re-attach"
 
