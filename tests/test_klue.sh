@@ -78,10 +78,6 @@ test_reattachment_does_not_destroy_session() {
     kill "$pid1" 2>/dev/null
     wait "$pid1" 2>/dev/null || true
 
-    # Capture pane content before re-attach
-    local before
-    before=$(tmux capture-pane -t "$TEST_SESSION:test-win.0" -p | head -3)
-
     # Run klue again (should re-attach, not kill session)
     bash "$KLUE" --config "$TEST_CONFIG" &
     local pid2=$!
