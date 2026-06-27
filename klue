@@ -110,7 +110,7 @@ parse_config() {
                 rows+=("$current_row_height")
                 row_cmds+=("$current_row_commands")
                 row_widths+=("$current_row_widths")
-                ((row_count++))
+                ((row_count += 1))
             fi
             current_section="row"
             current_row_height=""
@@ -124,7 +124,7 @@ parse_config() {
                 rows+=("$current_row_height")
                 row_cmds+=("$current_row_commands")
                 row_widths+=("$current_row_widths")
-                ((row_count++))
+                ((row_count += 1))
             fi
             current_section="session"
             continue
@@ -133,7 +133,7 @@ parse_config() {
                 rows+=("$current_row_height")
                 row_cmds+=("$current_row_commands")
                 row_widths+=("$current_row_widths")
-                ((row_count++))
+                ((row_count += 1))
             fi
             current_section="env"
             continue
@@ -142,7 +142,7 @@ parse_config() {
                 rows+=("$current_row_height")
                 row_cmds+=("$current_row_commands")
                 row_widths+=("$current_row_widths")
-                ((row_count++))
+                ((row_count += 1))
             fi
             current_section="options"
             continue
@@ -245,7 +245,7 @@ parse_config() {
         rows+=("$current_row_height")
         row_cmds+=("$current_row_commands")
         row_widths+=("$current_row_widths")
-        ((row_count++))
+        ((row_count += 1))
     fi
 
     # Set global variables directly
@@ -298,7 +298,7 @@ else
         if [[ -n "$h" ]]; then
             min_height=$((min_height + h))
         else
-            ((flexible_rows++))
+            ((flexible_rows += 1))
             min_height=$((min_height + 5))
         fi
     done
