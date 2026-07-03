@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+export CONTAINER="ghcr.io/bbusse/klue:latest"
+#CONTAINER="${CONTAINER:-klue}"
+readonly CONTAINER
+export VERBOSE=1
+readonly VERBOSE
+export CONTAINER_PLATFORM="${CONTAINER_PLATFORM:-}"
+readonly CONTAINER_PLATFORM
+export CONFIG_PATH="klue.toml"
+export AWS_PROFILE="production"
+readonly AWS_PROFILE
+export AWS_REGION="eu-central-1"
+readonly AWS_REGION
+CONTAINER_HOME="/home/klue"
+readonly CONTAINER_HOME
+HOST_KUBECONFIG="${KUBECONFIG:-}"
+readonly HOST_KUBECONFIG
+SCRIPT_NAME=$(basename "$0")
+readonly SCRIPT_NAME
+
+if [[ $# -gt 0 ]]; then
+    CONFIG_PATH="$1"
+fi
+readonly CONFIG_PATH
+
+log() {
+    if ((1 == "${VERBOSE}")); then
+        echo "$@" >&2
+    fi
+
+    logger -p user.notice -t "${SCRIPT_NAME}" "$@"
+}
+
+error() {
+    echo "$@" >&2
+    logger -p user.error -t "${SCRIPT_NAME}" "$@"
+}
+
+if [[ -z $(command -v podman) ]]; then
+    if [[ -z $(command -v docker) ]]; then
+        error "Could not find container executor."
+        error "Install either podman or docker"
+        exit 1
+    else
+        executor=docker
+        log "Using ${executor} to run ${CONTAINER}"
+    fi
+else
+    executor=podman
+    log "Using ${executor} to run ${CONTAINER}"
+fi
+
+if [[ ! -f "${CONFIG_PATH}" ]]; then
+    error "Config file not found: ${CONFIG_PATH}"
+    exit 1
+fi
+
+if [[ -z "${DD_API_KEY:-}" ]]; then
+    error "DD_API_KEY is not set"
+    exit 1
+fi
+
+if [[ -z "${DD_APP_KEY:-}" ]]; then
+    error "DD_APP_KEY is not set"
+    exit 1
+fi
+
+MOUNT_CONFIG_PATH="${CONFIG_PATH}"
+TEMP_CONFIG_COPY=""
+TEMP_AWS_CACHE_DIR=""
+
+# Podman on macOS can only mount paths shared with the Podman VM (HOME is shared by default).
+# If user passes a config from an unshared path (e.g. /usr/local/src), stage a read-only copy under HOME.
+if [[ "${executor}" == "podman" && "${CONFIG_PATH}" != "${HOME}"/* ]]; then
+    TEMP_CONFIG_COPY="${HOME}/.klue-config.$(date +%s).$$.toml"
+    cp "${CONFIG_PATH}" "${TEMP_CONFIG_COPY}"
+    MOUNT_CONFIG_PATH="${TEMP_CONFIG_COPY}"
+    log "Staged config for podman mount: ${MOUNT_CONFIG_PATH}"
+fi
+
+cleanup() {
+    if [[ -n "${TEMP_CONFIG_COPY}" && -f "${TEMP_CONFIG_COPY}" ]]; then
+        rm -f "${TEMP_CONFIG_COPY}"
+    fi
+
+    if [[ -n "${TEMP_AWS_CACHE_DIR}" && -d "${TEMP_AWS_CACHE_DIR}" ]]; then
+        rm -rf "${TEMP_AWS_CACHE_DIR}"
+    fi
+}
+trap cleanup EXIT
+
+CONTAINER_KUBECONFIG=""
+if [[ -n "${HOST_KUBECONFIG}" ]]; then
+    IFS=':' read -r -a kubeconfig_parts <<<"${HOST_KUBECONFIG}"
+    for kubeconfig_part in "${kubeconfig_parts[@]}"; do
+        mapped_part="${kubeconfig_part}"
+        if [[ "${kubeconfig_part}" == "${HOME}"/* ]]; then
+            mapped_part="${CONTAINER_HOME}/${kubeconfig_part#"${HOME}/"}"
+        fi
+
+        if [[ -z "${CONTAINER_KUBECONFIG}" ]]; then
+            CONTAINER_KUBECONFIG="${mapped_part}"
+        else
+            CONTAINER_KUBECONFIG="${CONTAINER_KUBECONFIG}:${mapped_part}"
+        fi
+    done
+fi
+
+args=(
+    run --rm -it
+    -e "AWS_PROFILE=${AWS_PROFILE}"
+    -e "AWS_REGION=${AWS_REGION}"
+    -e DD_API_KEY
+    -e DD_APP_KEY
+    -v "${MOUNT_CONFIG_PATH}:/config.toml:ro"
+    -v "${HOME}/.kube:${CONTAINER_HOME}/.kube:ro"
+    -v "${HOME}/.aws:${CONTAINER_HOME}/.aws:ro"
+)
+
+TEMP_AWS_CACHE_DIR="${HOME}/.klue-aws-cache.$(date +%s).$$"
+mkdir -p "${TEMP_AWS_CACHE_DIR}"
+args+=(-v "${TEMP_AWS_CACHE_DIR}:${CONTAINER_HOME}/.aws/cli/cache:rw")
+
+container_term="${TERM:-xterm-256color}"
+if ! "${executor}" run --rm --entrypoint sh "${CONTAINER}" -lc "infocmp '${container_term}' >/dev/null 2>&1"; then
+    log "Terminal '${container_term}' not available in container terminfo, falling back to xterm-256color"
+    container_term="xterm-256color"
+fi
+args+=(-e "TERM=${container_term}")
+
+for passthrough_var in COLORTERM LANG LC_ALL LC_CTYPE; do
+    if [[ -n "${!passthrough_var:-}" ]]; then
+        args+=(-e "${passthrough_var}=${!passthrough_var}")
+    fi
+done
+
+if [[ -n "${CONTAINER_KUBECONFIG}" ]]; then
+    args+=(-e "KUBECONFIG=${CONTAINER_KUBECONFIG}")
+fi
+
+if [[ -n "${CONTAINER_PLATFORM}" ]]; then
+    args+=(--platform "${CONTAINER_PLATFORM}")
+fi
+
+if [[ -d "${HOME}/.aws/sso" ]]; then
+    args+=(-v "${HOME}/.aws/sso:${CONTAINER_HOME}/.aws/sso:ro")
+fi
+
+args+=(
+    --entrypoint /usr/local/bin/klue
+    "${CONTAINER}"
+    --config /config.toml
+)
+
+"${executor}" "${args[@]}"
