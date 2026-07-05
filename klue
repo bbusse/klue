@@ -280,15 +280,17 @@ if [[ "$STREAM" == true ]] && tmux has-session -t "$SESSION" 2>/dev/null; then
     :
 else
 
-    # Create tmux session
-    tmux kill-window -t "$SESSION:$WINDOW" 2>/dev/null || true
-    tmux new-session -A -s "$SESSION" -d -n "$WINDOW"
+    # Resolve terminal dimensions first, including the min height from the
+    # configured row heights, so new-session is always created at the final
+    # correct size. kill-session (not kill-window) ensures no stale session
+    # with old dimensions survives a restart.
+    _tput_cols=$(tput cols 2>/dev/null || echo 220)
+    _tput_lines=$(tput lines 2>/dev/null || echo 50)
+    term_cols=${COLUMNS:-$_tput_cols}
+    term_lines=${LINES:-$_tput_lines}
+    [[ -z "$term_cols" || "$term_cols" -lt 40 ]] && term_cols=220
+    [[ -z "$term_lines" || "$term_lines" -lt 10 ]] && term_lines=50
 
-    # Match window size to current terminal
-    # If all rows have explicit heights, force exact total height so tmux
-    # doesn't distribute surplus lines to an arbitrary row
-    term_cols=${COLUMNS:-$(tput cols)}
-    term_lines=${LINES:-$(tput lines)}
     # Calculate minimum height needed from row heights
     # Pane separators are between rows, so there are ROW_COUNT-1 separator lines
     min_height=0
@@ -310,7 +312,10 @@ else
     elif ((term_lines < min_height)); then
         term_lines=$min_height
     fi
-    tmux resize-window -t "$SESSION:$WINDOW" -x "$term_cols" -y "$term_lines"
+
+    # Kill the whole session so no stale width/height is inherited via -A reuse
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    tmux new-session -s "$SESSION" -d -n "$WINDOW" -x "$term_cols" -y "$term_lines"
 
     # Apply options
     if [[ -n "${_OPT_BORDER_STYLE:-}" ]]; then
@@ -332,9 +337,18 @@ else
     first_pane=$(tmux display-message -t "$SESSION:$WINDOW" -p '#{pane_id}')
     row_panes+=("$first_pane")
 
-    # Create additional rows by splitting vertically from the bottom
+    # Create additional rows by splitting vertically.
+    # For each new row r, the new (bottom) pane must hold rows r..N-1 plus
+    # their separators so the parent pane ends up at exactly its configured
+    # height. Passing -l <remaining> to split-window achieves this precisely.
     for ((r = 1; r < ROW_COUNT; r++)); do
-        new_pane=$(tmux split-window -t "${row_panes[$((r - 1))]}" -v -P -F '#{pane_id}')
+        remaining_h=0
+        for ((i = r; i < ROW_COUNT; i++)); do
+            remaining_h=$((remaining_h + ${_ROW_HEIGHTS[$i]:-5}))
+        done
+        # Number of separators between rows r..ROW_COUNT-1
+        split_l=$((remaining_h + ROW_COUNT - 1 - r))
+        new_pane=$(tmux split-window -t "${row_panes[$((r - 1))]}" -v -l "$split_l" -P -F '#{pane_id}')
         row_panes+=("$new_pane")
     done
 
