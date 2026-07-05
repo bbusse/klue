@@ -1,0 +1,21 @@
+name: Shfmt
+
+on:
+  push:
+    paths-ignore:
+      - '**.md'
+    branches:
+      - '**'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+    branches:
+      - '**'
+  workflow_dispatch:
+
+jobs:
+  shfmt-check:
+    uses: bbusse/github-workflows/.github/workflows/run-shfmt.yml@dev
+    with:
+      working_directory: .
+      target_path: klue
