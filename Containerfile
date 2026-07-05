@@ -48,6 +48,10 @@ RUN cat > /home/klue/.zshrc <<'EOF' \
 
 export PATH="/usr/local/bin:/usr/local/src/awsh:$PATH"
 
+# Disable SIGTTOU so TUI processes (e.g. vju-t) launched during startup
+# are not suspended when they write to the tty before reaching the foreground.
+stty -tostop 2>/dev/null || true
+
 if [[ -f /usr/local/src/k8sh/k8sh ]]; then
     source /usr/local/src/k8sh/k8sh
 fi
