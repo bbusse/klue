@@ -33,9 +33,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chmod +x /usr/local/bin/kubectl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --branch dev https://github.com/bbusse/awsh.git /usr/local/src/awsh \
-    && git clone --branch dev https://github.com/bbusse/k8sh.git /usr/local/src/k8sh \
-    && git clone --branch dev https://github.com/bbusse/python-datadog.git /usr/local/src/pyqdd \
+RUN git clone --branch dev --depth 1 https://github.com/bbusse/awsh.git /usr/local/src/awsh \
+    && git clone --branch dev --depth 1 https://github.com/bbusse/k8sh.git /usr/local/src/k8sh \
+    && git clone --branch dev --depth 1 https://github.com/bbusse/pyqdd.git /usr/local/src/pyqdd \
     && find /usr/local/src/pyqdd -maxdepth 1 -type f -name "*.py" -exec \
         sed -i '/^from __future__ import annotations$/a import sys\nsys.path.insert(0, "/opt/pyqdd-venv/lib/python3.11/site-packages")' {} + \
     && useradd --create-home --home-dir /home/klue --shell /bin/zsh --uid 10001 klue \
