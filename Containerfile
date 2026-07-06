@@ -1,4 +1,4 @@
-ARG VJU_T_VERSION=v0-rc0
+ARG VJU_T_VERSION=latest
 
 FROM golang:1-bookworm AS textimg-builder
 RUN go install github.com/jiro4989/textimg/v3@latest \
