@@ -7,6 +7,7 @@
 
 KLUE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/klue"
 TEST_CONFIG="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test_config.toml"
+TEST_CONFIG_5PANES="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test_config_5panes.toml"
 TEST_SESSION="klue-test"
 TEST_WINDOW="test-win"
 
@@ -55,6 +56,11 @@ wait_for_http_200() {
 }
 
 run_klue_bg() {
+    local cols=120
+    if [[ "$1" == "--cols" ]]; then
+        cols="$2"
+        shift 2
+    fi
     local -a args=("$@")
 
     local cmd
@@ -65,15 +71,15 @@ run_klue_bg() {
 
     # Force adequate dimensions for tests regardless of the current terminal.
     if script --version 2>&1 | grep -q 'GNU\|util-linux'; then
-        # GNU script: script -qefc <cmd> /dev/null
-        TERM="xterm-256color" COLUMNS="120" LINES="50" \
-            script -qefc "$cmd" /dev/null &
+        # GNU script: set pty cols/rows via stty so tmux attach doesn't reflow
+        TERM="xterm-256color" COLUMNS="$cols" LINES="50" \
+            script -qefc "stty cols $cols rows 50 2>/dev/null; $cmd" /dev/null &
     elif command -v script >/dev/null 2>&1; then
-        # BSD script (macOS): script -q /dev/null <shell> -c <cmd>
-        TERM="xterm-256color" COLUMNS="120" LINES="50" \
-            script -q /dev/null bash -c "$cmd" &
+        # BSD script (macOS): same stty trick inside the subshell
+        TERM="xterm-256color" COLUMNS="$cols" LINES="50" \
+            script -q /dev/null bash -c "stty cols $cols rows 50 2>/dev/null; $cmd" &
     else
-        TERM="xterm-256color" COLUMNS="120" LINES="50" \
+        TERM="xterm-256color" COLUMNS="$cols" LINES="50" \
             bash "$KLUE" "${args[@]}" &
     fi
 
@@ -303,6 +309,54 @@ test_no_suspension_with_multiple_panes() {
 
     assert "test -z '${suspended# }'" \
         "no pane should be suspended (SIGTTOU); suspended panes:${suspended}"
+}
+
+# Pane width layout
+test_pane_widths_single_row() {
+    # Verify that explicit widths in a single-row config are honoured.
+    # Config: one row, 5 panes, width = [66,35,0,35,0]
+    # Panes 0, 1, 3 must end up at their specified widths.
+    #
+    # Run klue with stdin from /dev/null so that the tmux attach-session at
+    # the end fails cleanly (no controlling tty) and the session is left
+    # detached at its full 200-col width — no PTY reflow.
+
+    local pid
+    TERM="xterm-256color" COLUMNS="200" LINES="50" \
+        bash "$KLUE" --config "$TEST_CONFIG_5PANES" </dev/null &>/dev/null &
+    pid=$!
+
+    assert "wait_for_session 12" \
+        "tmux session should exist after startup"
+    assert "wait_for_pane_count 5 12" \
+        "should have 5 panes"
+
+    # Poll until pane 0 reaches its target width — klue applies resize-pane
+    # after all splits, so this may lag slightly behind pane creation.
+    local deadline=$((SECONDS + 10))
+    while ((SECONDS < deadline)); do
+        local probe
+        probe=$(tmux list-panes -t "$TEST_SESSION:$TEST_WINDOW" \
+            -F '#{pane_width}' 2>/dev/null | head -1)
+        [[ "$probe" == "66" ]] && break
+        sleep 0.2
+    done
+
+    local -a widths=()
+    while IFS= read -r w; do
+        widths+=("$w")
+    done < <(tmux list-panes -t "$TEST_SESSION:$TEST_WINDOW" \
+        -F '#{pane_width}' 2>/dev/null)
+
+    assert_equals "66" "${widths[0]}" \
+        "pane 0 width should be 66 (got ${widths[0]:-?})"
+    assert_equals "35" "${widths[1]}" \
+        "pane 1 width should be 35 (got ${widths[1]:-?})"
+    assert_equals "35" "${widths[3]}" \
+        "pane 3 width should be 35 (got ${widths[3]:-?})"
+
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null || true
 }
 
 # Container tests
