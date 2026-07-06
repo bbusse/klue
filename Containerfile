@@ -1,10 +1,10 @@
 ARG VJU_T_VERSION=latest
-
 FROM golang:1-bookworm AS textimg-builder
 RUN go install github.com/jiro4989/textimg/v3@latest \
     && git clone --branch dev --depth 1 https://github.com/bbusse/awsh.git /usr/local/src/awsh \
     && git clone --branch dev --depth 1 https://github.com/bbusse/k8sh.git /usr/local/src/k8sh \
-    && git clone --branch dev --depth 1 https://github.com/bbusse/pyqdd.git /usr/local/src/pyqdd
+    && git clone --branch dev --depth 1 https://github.com/bbusse/pyqdd.git /usr/local/src/pyqdd \
+    && git clone --branch dev --depth 1 https://github.com/bbusse/vju-t.git /usr/local/src/vju-t
 
 FROM python:3.11 AS pyqdd-deps-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -19,31 +19,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && find /opt/pyqdd -type d -name '*.dist-info' -exec rm -rf {} + 2>/dev/null; \
        find /opt/pyqdd -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null; true
 
-# Downloads and UPX-compresses kubectl, vju-t, and textimg in one stage so
-# upx never lands in the runtime image.
+# Downloads kubectl, vju-t, and textimg; optionally UPX-compresses them.
+# upx never lands in the runtime image. UPX is skipped silently if the
+# download fails (e.g. network restrictions in CI).
 FROM debian:bookworm-slim AS binary-compressor
 ARG VJU_T_VERSION
+COPY --from=textimg-builder /usr/local/src/vju-t/VERSION /tmp/vju-t-version
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates xz-utils \
-    && rm -rf /var/lib/apt/lists/* \
-    && ARCH=$(dpkg --print-architecture) \
-    && curl -fsSL "https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-${ARCH}_linux.tar.xz" \
-         -o /tmp/upx.tar.xz \
-    && tar -xJf /tmp/upx.tar.xz -C /tmp \
-    && mv /tmp/upx-4.2.4-${ARCH}_linux/upx /usr/local/bin/upx \
-    && rm -rf /tmp/upx.tar.xz /tmp/upx-4.2.4-* \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN ARCH=$(dpkg --print-architecture) \
     && curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl" \
          -o /usr/local/bin/kubectl \
-    && chmod +x /usr/local/bin/kubectl \
-    && if [ "$VJU_T_VERSION" = "latest" ]; then \
-         DOWNLOAD_URL="https://github.com/bbusse/vju-t/releases/latest/download/vju-t-linux-${ARCH}"; \
+    && chmod +x /usr/local/bin/kubectl
+RUN ARCH=$(dpkg --print-architecture) \
+    && VJU_T_VER="${VJU_T_VERSION:-latest}" \
+    && if [ "$VJU_T_VER" = "latest" ]; then \
+         VJU_T_TAG=$(cat /tmp/vju-t-version); \
        else \
-         DOWNLOAD_URL="https://github.com/bbusse/vju-t/releases/download/${VJU_T_VERSION}/vju-t-linux-${ARCH}-${VJU_T_VERSION}"; \
+         VJU_T_TAG="$VJU_T_VER"; \
        fi \
-    && curl -fsSL "$DOWNLOAD_URL" -o /usr/local/bin/vju-t \
+    && curl -fsSL "https://github.com/bbusse/vju-t/releases/download/${VJU_T_TAG}/vju-t-linux-${ARCH}-${VJU_T_TAG}" \
+         -o /usr/local/bin/vju-t \
     && chmod +x /usr/local/bin/vju-t
 COPY --from=textimg-builder /go/bin/textimg /usr/local/bin/textimg
-RUN upx --best /usr/local/bin/kubectl /usr/local/bin/textimg /usr/local/bin/vju-t
+RUN ARCH=$(dpkg --print-architecture) \
+    && { curl -fsSL "https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-${ARCH}_linux.tar.xz" \
+              -o /tmp/upx.tar.xz \
+         && tar -xJf /tmp/upx.tar.xz -C /tmp \
+         && mv /tmp/upx-4.2.4-${ARCH}_linux/upx /usr/local/bin/upx \
+         && rm -rf /tmp/upx.tar.xz /tmp/upx-4.2.4-* \
+         && upx --best /usr/local/bin/kubectl \
+         && upx --best /usr/local/bin/textimg \
+         && upx --best /usr/local/bin/vju-t; \
+       } || printf 'UPX not available; binaries remain uncompressed\n'
 
 FROM debian:bookworm-slim
 # Prevent dpkg from writing docs, completions, and other cruft during install.
