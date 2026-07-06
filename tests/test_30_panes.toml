@@ -1,0 +1,15 @@
+[session]
+name = "klue-test"
+window = "test-win"
+
+# 2 rows x 5 panes = 10 panes total.
+# Using a modest count that fits in any 80x30 terminal while still
+# testing concurrent pane startup for SIGTTOU regression.
+
+[[row]]
+height = 5
+command = ["echo pane-0","echo pane-1","echo pane-2","echo pane-3","echo pane-4"]
+
+[[row]]
+height = 5
+command = ["echo pane-5","echo pane-6","echo pane-7","echo pane-8","echo pane-9"]

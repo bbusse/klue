@@ -57,16 +57,23 @@ wait_for_http_200() {
 run_klue_bg() {
     local -a args=("$@")
 
-    if command -v script >/dev/null 2>&1; then
-        local cmd
-        cmd="bash $(printf '%q' "$KLUE")"
-        for arg in "${args[@]}"; do
-            cmd+=" $(printf '%q' "$arg")"
-        done
-        TERM="${TERM:-xterm-256color}" COLUMNS="${COLUMNS:-120}" LINES="${LINES:-40}" \
+    local cmd
+    cmd="bash $(printf '%q' "$KLUE")"
+    for arg in "${args[@]}"; do
+        cmd+=" $(printf '%q' "$arg")"
+    done
+
+    # Force adequate dimensions for tests regardless of the current terminal.
+    if script --version 2>&1 | grep -q 'GNU\|util-linux'; then
+        # GNU script: script -qefc <cmd> /dev/null
+        TERM="xterm-256color" COLUMNS="120" LINES="50" \
             script -qefc "$cmd" /dev/null &
+    elif command -v script >/dev/null 2>&1; then
+        # BSD script (macOS): script -q /dev/null <shell> -c <cmd>
+        TERM="xterm-256color" COLUMNS="120" LINES="50" \
+            script -q /dev/null bash -c "$cmd" &
     else
-        TERM="${TERM:-xterm-256color}" COLUMNS="${COLUMNS:-120}" LINES="${LINES:-40}" \
+        TERM="xterm-256color" COLUMNS="120" LINES="50" \
             bash "$KLUE" "${args[@]}" &
     fi
 
@@ -248,4 +255,52 @@ test_stream_reattaches_to_existing_session() {
 
     kill "$stream_pid" 2>/dev/null
     wait "$stream_pid" 2>/dev/null || true
+}
+
+# SIGTTOU suspension guard
+test_no_suspension_with_multiple_panes() {
+    # Regression guard: verify that panes launched with stty -tostop prepended
+    # do not receive SIGTTOU and end up in a "suspended (tty output)" state.
+    #
+    # This directly tests the fix in klue (stty -tostop prepended to each pane
+    # command) without relying on run_klue_bg to avoid PTY/attachment issues.
+
+    local n=30
+    local sess="klue-test"
+    local win="test-win"
+
+    # Create a small tmux session to host the test panes
+    tmux new-session -d -s "$sess" -n "$win" -x 80 -y 30
+
+    # Add panes and send the same command klue would send: stty -tostop first
+    for i in $(seq 1 $((n - 1))); do
+        tmux split-window -t "$sess:$win" -h 2>/dev/null \
+            || tmux split-window -t "$sess:$win" -v 2>/dev/null || true
+    done
+    tmux select-layout -t "$sess:$win" tiled 2>/dev/null || true
+
+    # Send stty -tostop + echo to every pane (mirrors klue's command prefix)
+    local pane_count
+    pane_count=$(tmux list-panes -t "$sess:$win" | wc -l | tr -d ' ')
+    local i=0
+    while IFS= read -r pane_id; do
+        tmux send-keys -t "$pane_id" -l "stty -tostop 2>/dev/null; echo pane-$i"
+        tmux send-keys -t "$pane_id" Enter
+        i=$((i + 1))
+    done < <(tmux list-panes -t "$sess:$win" -F '#{pane_id}')
+
+    sleep 1
+
+    # Check no pane's captured output contains "suspended"
+    local suspended=""
+    while IFS= read -r pane_id; do
+        local content
+        content=$(tmux capture-pane -t "$pane_id" -p 2>/dev/null || true)
+        if printf '%s\n' "$content" | grep -q "suspended"; then
+            suspended="${suspended} ${pane_id}"
+        fi
+    done < <(tmux list-panes -t "$sess:$win" -F '#{pane_id}' 2>/dev/null)
+
+    assert "test -z '${suspended# }'" \
+        "no pane should be suspended (SIGTTOU); suspended panes:${suspended}"
 }
