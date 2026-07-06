@@ -444,7 +444,7 @@ test_container_pyqdd_scripts_present() {
 test_container_venv_python_works() {
     _skip_if_no_container
     local out
-    out=$(_container_run '/opt/pyqdd-venv/bin/python3 -c "import botocore; print(botocore.__version__)"')
+    out=$(_container_run 'python3 -c "import botocore; print(botocore.__version__)"')
     assert_matches "[0-9]" "$out" \
-        "venv python should be able to import botocore (got: $out)"
+        "python3 should be able to import botocore via PYTHONPATH (got: $out)"
 }
