@@ -304,3 +304,147 @@ test_no_suspension_with_multiple_panes() {
     assert "test -z '${suspended# }'" \
         "no pane should be suspended (SIGTTOU); suspended panes:${suspended}"
 }
+
+# Container tests
+# Require a built klue container image (podman or docker).
+
+CONTAINER_IMAGE="${KLUE_TEST_IMAGE:-klue}"
+
+_container_runtime() {
+    if command -v podman >/dev/null 2>&1; then
+        printf 'podman'
+    elif command -v docker >/dev/null 2>&1; then
+        printf 'docker'
+    else
+        printf ''
+    fi
+}
+
+_container_run() {
+    local runtime
+    runtime=$(_container_runtime)
+    "$runtime" run --rm --entrypoint "" "$CONTAINER_IMAGE" sh -c "$1"
+}
+
+_skip_if_no_container() {
+    local runtime
+    runtime=$(_container_runtime)
+    if [[ -z "$runtime" ]]; then
+        skip "no container runtime (podman/docker) available"
+    fi
+    if ! "$runtime" image exists "$CONTAINER_IMAGE" 2>/dev/null \
+       && ! "$runtime" inspect "$CONTAINER_IMAGE" >/dev/null 2>&1; then
+        skip "container image '$CONTAINER_IMAGE' not found — build it first"
+    fi
+}
+
+test_container_image_exists() {
+    _skip_if_no_container
+    local runtime
+    runtime=$(_container_runtime)
+    assert "$runtime image exists '$CONTAINER_IMAGE' 2>/dev/null \
+            || $runtime inspect '$CONTAINER_IMAGE' >/dev/null 2>&1" \
+        "container image '$CONTAINER_IMAGE' should exist"
+}
+
+test_container_runs_as_non_root() {
+    _skip_if_no_container
+    local uid
+    uid=$(_container_run 'id -u')
+    assert "test '$uid' -ne 0" \
+        "container should not run as root (uid=$uid)"
+}
+
+test_container_user_is_klue() {
+    _skip_if_no_container
+    local user
+    user=$(_container_run 'id -un')
+    assert_equals "klue" "$user" "container user should be 'klue'"
+}
+
+test_container_aws_cli_works() {
+    _skip_if_no_container
+    local out
+    out=$(_container_run 'aws --version 2>&1')
+    assert_matches "aws-cli" "$out" "aws --version should print version string"
+}
+
+test_container_jq_works() {
+    _skip_if_no_container
+    local out
+    out=$(_container_run 'jq --version')
+    assert_matches "jq-" "$out" "jq --version should print version string"
+}
+
+test_container_kubectl_present() {
+    _skip_if_no_container
+    local out
+    out=$(_container_run 'kubectl version --client --output=yaml 2>&1 || kubectl version --client 2>&1')
+    assert_matches "gitVersion" "$out" \
+        "kubectl --client should print version info"
+}
+
+test_container_textimg_present() {
+    _skip_if_no_container
+    local out
+    out=$(_container_run 'textimg --version 2>&1')
+    assert_matches "textimg" "$out" "textimg should be present and print version"
+}
+
+test_container_tmux_present() {
+    _skip_if_no_container
+    local out
+    out=$(_container_run 'tmux -V')
+    assert_matches "tmux" "$out" "tmux should be present"
+}
+
+test_container_zsh_present() {
+    _skip_if_no_container
+    local out
+    out=$(_container_run 'zsh --version')
+    assert_matches "zsh" "$out" "zsh should be present"
+}
+
+test_container_vju_t_present() {
+    _skip_if_no_container
+    assert "_container_run 'test -x /usr/local/bin/vju-t'" \
+        "vju-t binary should be present at /usr/local/bin/vju-t"
+}
+
+test_container_klue_help() {
+    _skip_if_no_container
+    local out
+    out=$(_container_run '/usr/local/bin/klue --help 2>&1 || true')
+    assert_matches "Usage: klue" "$out" \
+        "klue --help should print usage information"
+}
+
+test_container_awsh_scripts_present() {
+    _skip_if_no_container
+    local count
+    count=$(_container_run 'find /usr/local/src/awsh -maxdepth 1 -type f -name "aws-*" | wc -l | tr -d " "')
+    assert "test '$count' -gt 0" \
+        "awsh scripts should be present in /usr/local/src/awsh (found $count)"
+}
+
+test_container_k8sh_present() {
+    _skip_if_no_container
+    assert "_container_run 'test -f /usr/local/src/k8sh/k8sh'" \
+        "k8sh script should be present at /usr/local/src/k8sh/k8sh"
+}
+
+test_container_pyqdd_scripts_present() {
+    _skip_if_no_container
+    local count
+    count=$(_container_run 'find /usr/local/src/pyqdd -maxdepth 1 -type f -name "*.py" | wc -l | tr -d " "')
+    assert "test '$count' -gt 0" \
+        "pyqdd Python scripts should be present in /usr/local/src/pyqdd (found $count)"
+}
+
+test_container_venv_python_works() {
+    _skip_if_no_container
+    local out
+    out=$(_container_run '/opt/pyqdd-venv/bin/python3 -c "import botocore; print(botocore.__version__)"')
+    assert_matches "[0-9]" "$out" \
+        "venv python should be able to import botocore (got: $out)"
+}
