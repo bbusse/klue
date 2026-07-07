@@ -359,6 +359,44 @@ test_pane_widths_single_row() {
     wait "$pid" 2>/dev/null || true
 }
 
+# Copy-mode guard
+test_no_copy_mode_on_startup() {
+    # Regression guard: no pane should enter copy-mode when klue starts.
+    local pid
+    pid=$(run_klue_bg --config "$TEST_CONFIG")
+
+    assert "wait_for_session 12" \
+        "tmux session should exist after startup"
+    assert "wait_for_pane_count 3 12" \
+        "should have 3 panes"
+    sleep 1
+
+    local panes_in_mode
+    panes_in_mode=$(tmux list-panes -t "$TEST_SESSION:$TEST_WINDOW" \
+        -F '#{pane_index} #{pane_in_mode} #{pane_mode}' 2>/dev/null)
+    assert_equals "" \
+        "$(printf '%s\n' "$panes_in_mode" | awk '$2 != "0" {print $0}')" \
+        "no pane should be in copy-mode or any other special mode"
+
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null || true
+}
+
+test_send_keys_uses_literal_flag() {
+    # Static guard: every send-keys call that passes a variable or quoted
+    # string as the CONTENT (last argument) must use the -l (literal) flag.
+    # Key names like 'Enter' do not need -l and are excluded by checking only
+    # the last token on each line.
+    local bare_send_keys
+    bare_send_keys=$(grep 'send-keys' "$KLUE" \
+        | grep -v -- '-l' \
+        | grep -v '^[[:space:]]*#' \
+        | awk 'NF>0 { last=$NF; if (last ~ /["\$]/) print }' \
+        || true)
+    assert_equals "" "$bare_send_keys" \
+        "found send-keys without -l flag (causes copy-mode): $bare_send_keys"
+}
+
 # Container tests
 # Require a built klue container image (podman or docker).
 
@@ -501,4 +539,155 @@ test_container_venv_python_works() {
     out=$(_container_run 'python3 -c "import botocore; print(botocore.__version__)"')
     assert_matches "[0-9]" "$out" \
         "python3 should be able to import botocore via PYTHONPATH (got: $out)"
+}
+
+test_container_stays_alive() {
+    # Regression guard: container must not exit (SIGKILL/crash) after startup.
+    # Runs klue in non-stream mode (same as STREAM=false in the run script) and
+    # verifies the container is still running after 10 seconds.
+    _skip_if_no_container
+
+    local runtime container_id
+    runtime=$(_container_runtime)
+
+    container_id=$("$runtime" run -d \
+        -v "$TEST_CONFIG:/etc/klue/config.toml:ro" \
+        --entrypoint /usr/local/bin/klue \
+        "$CONTAINER_IMAGE" \
+        --config /etc/klue/config.toml \
+        2>/dev/null) || {
+        assert_fail "container failed to start"
+        return
+    }
+
+    sleep 10
+
+    local status
+    status=$("$runtime" inspect "$container_id" \
+        --format '{{.State.Status}}' 2>/dev/null || printf "gone")
+
+    "$runtime" rm -f "$container_id" >/dev/null 2>&1 || true
+
+    assert_equals "running" "$status" \
+        "container should still be running after 10 s (was: $status)"
+}
+
+test_container_stays_alive_after_exec_detach() {
+    # Regression guard: container must survive an exec+detach cycle.
+    # Simulates the run script: attach via exec, detach, verify container lives.
+    _skip_if_no_container
+
+    local runtime container_id
+    runtime=$(_container_runtime)
+
+    container_id=$("$runtime" run -d \
+        -v "${TEST_CONFIG}:/etc/klue/config.toml:ro" \
+        --entrypoint /usr/local/bin/klue \
+        "$CONTAINER_IMAGE" \
+        --config /etc/klue/config.toml \
+        2>/dev/null) || {
+        assert_fail "container failed to start"
+        return
+    }
+
+    # Wait for session
+    local deadline=$((SECONDS + 20))
+    while ((SECONDS < deadline)); do
+        "$runtime" exec "$container_id" tmux list-sessions >/dev/null 2>&1 && break
+        sleep 0.3
+    done
+
+    # Attach briefly via exec, then disconnect
+    "$runtime" exec "$container_id" tmux attach-session -d 2>/dev/null || true
+
+    sleep 5
+
+    local status
+    status=$("$runtime" inspect "$container_id" \
+        --format '{{.State.Status}}' 2>/dev/null || printf "gone")
+
+    "$runtime" rm -f "$container_id" >/dev/null 2>&1 || true
+
+    assert_equals "running" "$status" \
+        "container should survive exec+detach (was: $status)"
+}
+
+test_container_stream_stays_alive() {
+    # Regression guard: container must survive in streaming mode.
+    _skip_if_no_container
+
+    local runtime stream_port container_id
+    runtime=$(_container_runtime)
+    stream_port=15997
+
+    container_id=$("$runtime" run -d \
+        -p "${stream_port}:${stream_port}" \
+        -v "${TEST_CONFIG}:/etc/klue/config.toml:ro" \
+        --entrypoint /usr/local/bin/klue \
+        "$CONTAINER_IMAGE" \
+        --config /etc/klue/config.toml \
+        --stream --stream-port "${stream_port}" --stream-fps 1 \
+        2>/dev/null) || {
+        assert_fail "container failed to start in stream mode"
+        return
+    }
+
+    # Wait for HTTP server to come up (up to 30 s)
+    local deadline=$((SECONDS + 30))
+    local http_code="000"
+    while ((SECONDS < deadline)); do
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+            "http://localhost:${stream_port}/" 2>/dev/null || true)
+        [[ "$http_code" == "200" ]] && break
+        sleep 0.5
+    done
+
+    # Simulate exec attach+detach
+    "$runtime" exec "$container_id" tmux attach-session -d 2>/dev/null || true
+
+    sleep 5
+
+    local status
+    status=$("$runtime" inspect "$container_id" \
+        --format '{{.State.Status}}' 2>/dev/null || printf "gone")
+
+    "$runtime" rm -f "$container_id" >/dev/null 2>&1 || true
+
+    assert_equals "200" "$http_code" \
+        "stream HTTP server should have responded 200 (got $http_code)"
+    assert_equals "running" "$status" \
+        "streaming container should survive exec+detach (was: $status)"
+}
+
+test_container_stream_http_200() {    _skip_if_no_container
+
+    local runtime stream_port container_id
+    runtime=$(_container_runtime)
+    stream_port=15998
+
+    container_id=$("$runtime" run -d \
+        -p "${stream_port}:${stream_port}" \
+        -v "${TEST_CONFIG}:/etc/klue/config.toml:ro" \
+        --entrypoint /usr/local/bin/klue \
+        "$CONTAINER_IMAGE" \
+        --config /etc/klue/config.toml \
+        --stream --stream-port "${stream_port}" --stream-fps 1 \
+        2>/dev/null) || {
+        assert_fail "container failed to start"
+        return
+    }
+
+    local deadline=$((SECONDS + 30))
+    local http_code="000"
+    while ((SECONDS < deadline)); do
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+            "http://localhost:${stream_port}/" 2>/dev/null || true)
+        [[ "$http_code" == "200" ]] && break
+        sleep 0.5
+    done
+
+    "$runtime" rm -f "$container_id" >/dev/null 2>&1 || true
+
+    assert_equals "200" "$http_code" \
+        "container MJPEG HTTP server should respond 200 (got $http_code)"
 }
