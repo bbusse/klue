@@ -457,7 +457,7 @@ fi # End of layout creation (skipped when --stream on existing session)
 
 # Stream mode: render panes to PNG frames, pipe to GStreamer
 if [[ "$STREAM" == true ]]; then
-    TEXTIMG="$(go env GOPATH 2>/dev/null)/bin/textimg"
+    TEXTIMG="$(go env GOPATH 2>/dev/null || true)/bin/textimg"
     if [[ ! -x "$TEXTIMG" ]]; then
         # Also check PATH (e.g. in containers)
         TEXTIMG="$(command -v textimg 2>/dev/null || true)"
@@ -477,6 +477,12 @@ if [[ "$STREAM" == true ]]; then
     tmux capture-pane -t "$SESSION:$WINDOW.0" -p -e |
         "$TEXTIMG" -f "$STREAM_FONT" -F "$STREAM_FONTSIZE" -o "$FRAME_TMPDIR/probe.png" 2>/dev/null
 
+    if [[ ! -f "$FRAME_TMPDIR/probe.png" ]]; then
+        echo "Error: textimg probe failed — font='$STREAM_FONT' size=$STREAM_FONTSIZE" >&2
+        echo "  Check font path and that the tmux session has at least one pane." >&2
+        exit 1
+    fi
+
     read -r WCOLS WROWS <<<"$(tmux list-panes -t "$SESSION:$WINDOW" -F '#{window_width} #{window_height}' | head -1)"
     read -r P0_W P0_H <<<"$(tmux list-panes -t "$SESSION:$WINDOW" -F '#{pane_width} #{pane_height}' | head -1)"
 
@@ -487,7 +493,11 @@ if [[ "$STREAM" == true ]]; then
     CANVAS_W=$(python3 -c "print(int($WCOLS * $CELL_W))")
     CANVAS_H=$(python3 -c "print(int($WROWS * $CELL_H))")
 
-    echo "Canvas: ${CANVAS_W}x${CANVAS_H}px (cell: ${CELL_W}x${CELL_H})"
+    if [[ -z "$CANVAS_W" || -z "$CANVAS_H" || "${CANVAS_W:-0}" -eq 0 || "${CANVAS_H:-0}" -eq 0 ]]; then
+        echo "Error: canvas dimension calculation failed" >&2
+        echo "  probe=${PROBE_W}x${PROBE_H} pane=${P0_W}x${P0_H} window=${WCOLS}x${WROWS}" >&2
+        exit 1
+    fi
 
     # MJPEG streaming: render panes → composite → serve as motion JPEG over HTTP
     LAYOUT_FILE="$FRAME_TMPDIR/layout.txt"
@@ -611,6 +621,16 @@ with socketserver.TCPServer(("0.0.0.0", $STREAM_PORT), MJPEGHandler) as srv:
 PYEOF
     SERVER_PID=$!
     wait "$SERVER_PID"
+fi
+
+# In a container (podman or docker), attach would immediately exit because
+# there is no interactive terminal on PID 1.  Keep the process alive so the
+# tmux server keeps running; users attach via `exec -it … tmux attach-session`.
+if [[ -f /run/.containerenv || -f /.dockerenv ]]; then
+    while tmux has-session -t "$SESSION" 2>/dev/null; do
+        sleep 10
+    done
+    exit 0
 fi
 
 # Attach to the session

@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-export CONTAINER="ghcr.io/bbusse/klue:latest"
-#CONTAINER="${CONTAINER:-klue}"
+#export CONTAINER="ghcr.io/bbusse/klue:latest"
+CONTAINER="${CONTAINER:-klue}"
 readonly CONTAINER
 export VERBOSE=1
 readonly VERBOSE
@@ -16,6 +16,10 @@ export AWS_REGION="eu-central-1"
 readonly AWS_REGION
 CONTAINER_HOME="/home/klue"
 readonly CONTAINER_HOME
+STREAM_PORT=6442
+readonly STREAM_PORT
+STREAM=true
+readonly STREAM
 HOST_KUBECONFIG="${KUBECONFIG:-}"
 readonly HOST_KUBECONFIG
 SCRIPT_NAME=$(basename "$0")
@@ -81,13 +85,33 @@ if [[ "${executor}" == "podman" && "${CONFIG_PATH}" != "${HOME}"/* ]]; then
     log "Staged config for podman mount: ${MOUNT_CONFIG_PATH}"
 fi
 
+CONTAINER_LOG=""
+LOGS_PID=""
+CONTAINER_ID_LIVE=""
+
 cleanup() {
+    kill "${LOGS_PID:-}" 2>/dev/null || true
     if [[ -n "${TEMP_CONFIG_COPY}" && -f "${TEMP_CONFIG_COPY}" ]]; then
         rm -f "${TEMP_CONFIG_COPY}"
     fi
-
     if [[ -n "${TEMP_AWS_CACHE_DIR}" && -d "${TEMP_AWS_CACHE_DIR}" ]]; then
         rm -rf "${TEMP_AWS_CACHE_DIR}"
+    fi
+    if [[ -n "${CONTAINER_ID_LIVE}" ]]; then
+        local cstatus cexit
+        cstatus=$("${executor}" inspect "${CONTAINER_ID_LIVE}" \
+            --format '{{.State.Status}}' 2>/dev/null || printf "gone")
+        cexit=$("${executor}" inspect "${CONTAINER_ID_LIVE}" \
+            --format '{{.State.ExitCode}}' 2>/dev/null || printf "?")
+        if [[ "$cstatus" != "running" ]]; then
+            log "Container exited: status=${cstatus} exitCode=${cexit}"
+            if [[ "$cexit" == "137" ]]; then
+                log "Exit 137 = SIGKILL (OOM or external kill)"
+            fi
+            log "Last logs:"
+            "${executor}" logs --tail 40 "${CONTAINER_ID_LIVE}" 2>&1 >&2 || true
+            "${executor}" rm -f "${CONTAINER_ID_LIVE}" >/dev/null 2>&1 || true
+        fi
     fi
 }
 trap cleanup EXIT
@@ -110,7 +134,7 @@ if [[ -n "${HOST_KUBECONFIG}" ]]; then
 fi
 
 args=(
-    run --rm -it
+    run
     -e "AWS_PROFILE=${AWS_PROFILE}"
     -e "AWS_REGION=${AWS_REGION}"
     -e DD_API_KEY
@@ -149,10 +173,69 @@ if [[ -d "${HOME}/.aws/sso" ]]; then
     args+=(-v "${HOME}/.aws/sso:${CONTAINER_HOME}/.aws/sso:ro")
 fi
 
+# Always run detached so the container persists after detach.
+# No --rm: we do explicit cleanup in cleanup() with post-mortem logging.
+args+=(-d)
+
+if [[ "${STREAM}" == "true" ]]; then
+    args+=(-p "${STREAM_PORT}:${STREAM_PORT}")
+fi
+
 args+=(
     --entrypoint /usr/local/bin/klue
     "${CONTAINER}"
     --config /config.toml
 )
 
-"${executor}" "${args[@]}"
+if [[ "${STREAM}" == "true" ]]; then
+    args+=(--stream --stream-port "${STREAM_PORT}" \
+           --stream-font "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
+fi
+
+container_id=$("${executor}" "${args[@]}")
+CONTAINER_ID_LIVE="$container_id"
+log "Container: ${container_id:0:12}"
+if [[ "${STREAM}" == "true" ]]; then
+    log "Stream:    http://localhost:${STREAM_PORT}/"
+fi
+log "Stop:      ${executor} rm -f ${container_id:0:12}"
+
+# Follow container logs to a temp file so they survive --rm.
+CONTAINER_LOG="${HOME}/.klue-container-${container_id:0:12}.log"
+"${executor}" logs -f "$container_id" >"$CONTAINER_LOG" 2>&1 &
+LOGS_PID=$!
+disown "$LOGS_PID" 2>/dev/null || true
+log "Logs:      tail -f ${CONTAINER_LOG}"
+
+# Wait for the tmux session to be ready inside the container
+deadline=$((SECONDS + 30))
+while ((SECONDS < deadline)); do
+    if "${executor}" exec "${container_id}" tmux list-sessions >/dev/null 2>&1; then
+        break
+    fi
+    # Check if the container has already died
+    if ! "${executor}" inspect "$container_id" >/dev/null 2>&1; then
+        error "Container died before session was ready. Check logs: ${CONTAINER_LOG}"
+        exit 1
+    fi
+    sleep 0.3
+done
+
+log "Attaching to dashboard (detach: Ctrl+B d)"
+"${executor}" exec -it -e "TERM=${container_term}" "${container_id}" tmux attach-session || true
+
+# After detach: report container status so the user knows what happened
+cstatus=$("${executor}" inspect "$container_id" \
+    --format '{{.State.Status}}' 2>/dev/null || printf "gone")
+log "Container status after detach: ${cstatus} (id: ${container_id:0:12})"
+if [[ "$cstatus" == "running" ]]; then
+    log "Re-attach: ${executor} exec -it ${container_id:0:12} tmux attach-session"
+elif [[ "$cstatus" == "gone" ]]; then
+    log "Container was already removed (--rm or podman restart policy)"
+else
+    cexit=$("${executor}" inspect "$container_id" \
+        --format '{{.State.ExitCode}}' 2>/dev/null || printf "?")
+    log "Container exited (exitCode=${cexit}). Logs:"
+    "${executor}" logs --tail 40 "$container_id" 2>&1 >&2 || true
+    "${executor}" rm -f "$container_id" >/dev/null 2>&1 || true
+fi

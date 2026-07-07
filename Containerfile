@@ -19,7 +19,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && find /opt/pyqdd -type d -name '*.dist-info' -exec rm -rf {} + 2>/dev/null; \
        find /opt/pyqdd -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null; true
 
-# Downloads kubectl, vju-t, and textimg; optionally UPX-compresses them.
+# Build vju-t from source on bookworm so glibc matches the runtime image.
+FROM rust:1-bookworm AS vju-t-builder
+COPY --from=textimg-builder /usr/local/src/vju-t /build/vju-t
+RUN cargo build --release --manifest-path /build/vju-t/Cargo.toml
+
+# Downloads kubectl and textimg; optionally UPX-compresses all three binaries.
 # upx never lands in the runtime image. UPX is skipped silently if the
 # download fails (e.g. network restrictions in CI).
 FROM debian:bookworm-slim AS binary-compressor
@@ -33,16 +38,7 @@ RUN ARCH=$(dpkg --print-architecture) \
     && curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl" \
          -o /usr/local/bin/kubectl \
     && chmod +x /usr/local/bin/kubectl
-RUN ARCH=$(dpkg --print-architecture) \
-    && VJU_T_VER="${VJU_T_VERSION:-latest}" \
-    && if [ "$VJU_T_VER" = "latest" ]; then \
-         VJU_T_TAG=$(cat /tmp/vju-t-version); \
-       else \
-         VJU_T_TAG="$VJU_T_VER"; \
-       fi \
-    && curl -fsSL "https://github.com/bbusse/vju-t/releases/download/${VJU_T_TAG}/vju-t-linux-${ARCH}-${VJU_T_TAG}" \
-         -o /usr/local/bin/vju-t \
-    && chmod +x /usr/local/bin/vju-t
+COPY --from=vju-t-builder /build/vju-t/target/release/vju-t /usr/local/bin/vju-t
 COPY --from=textimg-builder /go/bin/textimg /usr/local/bin/textimg
 RUN ARCH=$(dpkg --print-architecture) \
     && { curl -fsSL "https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-${ARCH}_linux.tar.xz" \
@@ -68,6 +64,7 @@ path-exclude=/usr/share/zsh/vendor-completions/*\n' \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tmux \
     zsh \
+    bc \
     bsdextrautils \
     jq \
     ca-certificates \
@@ -108,5 +105,6 @@ COPY klue /usr/local/bin/klue
 ENV KLUE_CONFIG="/etc/klue/config.toml"
 ENV LANG="C.UTF-8"
 ENV LC_ALL="C.UTF-8"
+EXPOSE 6442
 USER klue
 ENTRYPOINT ["/bin/sh", "-c", "exec /usr/local/bin/klue --config \"$KLUE_CONFIG\" \"$@\"", "--"]
