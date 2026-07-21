@@ -620,7 +620,7 @@ with socketserver.TCPServer(("0.0.0.0", $STREAM_PORT), MJPEGHandler) as srv:
     srv.serve_forever()
 PYEOF
     SERVER_PID=$!
-    wait "$SERVER_PID"
+    wait
 fi
 
 # In a container (podman or docker), attach would immediately exit because
