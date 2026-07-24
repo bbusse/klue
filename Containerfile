@@ -61,8 +61,9 @@ RUN cd /build/vju-t \
 FROM alpine:3
 RUN apk add --no-cache tmux python3 py3-pillow ttf-dejavu \
     && addgroup -g 10001 klue \
-    && adduser -D -h /home/klue -s /usr/local/bin/brush -u 10001 -G klue klue \
+    && adduser -D -h /home/klue -s /usr/local/bin/klue-shell -u 10001 -G klue klue \
     && echo '/usr/local/bin/brush' >> /etc/shells \
+    && echo '/usr/local/bin/klue-shell' >> /etc/shells \
     && mkdir -p /home/klue /etc/klue \
     && chown -R klue:klue /home/klue /etc/klue
 COPY --from=brush-builder /usr/local/cargo/bin/brush /usr/local/bin/brush
@@ -77,13 +78,15 @@ COPY --from=pyqdd-exp-builder /opt/pyqdd /opt/pyqdd
 COPY klue /usr/local/bin/klue
 RUN ln -s /usr/local/bin/brush /usr/local/bin/bash \
     && printf '#!/usr/bin/env python3\nimport sys\nsys.path.insert(0, "/opt/pyqdd")\nfrom awscli.clidriver import main\nsys.exit(main())\n' > /usr/local/bin/aws \
-    && chmod +x /usr/local/bin/aws
+    && chmod +x /usr/local/bin/aws \
+    && printf '#!/bin/sh\n# Unlike bash/zsh, brush only sources ~/.brushrc when passed -i explicitly\n# (being attached to a tty is not enough). tmux execs the login shell\n# directly with no way to inject flags, so this wrapper forces -i for\n# every pane, interactive or not.\nexec /usr/local/bin/brush -i "$@"\n' > /usr/local/bin/klue-shell \
+    && chmod +x /usr/local/bin/klue-shell
 
 RUN printf 'export PATH="/usr/local/bin:/usr/local/src/awsh:$PATH"\nexport PYTHONPATH="/opt/pyqdd"\nif [[ -f /usr/local/src/k8sh/k8sh ]]; then\n    source /usr/local/src/k8sh/k8sh\nfi\n' \
         > /home/klue/.brushrc \
     && chown klue:klue /home/klue/.brushrc
 
-ENV SHELL=/usr/local/bin/brush
+ENV SHELL=/usr/local/bin/klue-shell
 ENV PYTHONPATH=/opt/pyqdd
 ENV STREAM_FONT=/usr/share/fonts/dejavu/DejaVuSansMono.ttf
 ENV KLUE_CONFIG="/etc/klue/config.toml"
