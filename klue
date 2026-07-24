@@ -414,7 +414,7 @@ else
                     cmd="${_ENV_PREFIX}; ${cmd}"
                 fi
                 # Disable SIGTTOU before the command so TUI processes launched
-                # before .zshrc finishes are not suspended on tty output.
+                # before .brushrc finishes are not suspended on tty output.
                 cmd="stty -tostop 2>/dev/null; ${cmd}"
                 tmux send-keys -t "${pane_ids[$p]}" -l "$cmd"
                 tmux send-keys -t "${pane_ids[$p]}" Enter
