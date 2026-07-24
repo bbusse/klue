@@ -490,11 +490,11 @@ test_container_tmux_present() {
     assert_matches "tmux" "$out" "tmux should be present"
 }
 
-test_container_zsh_present() {
+test_container_brush_present() {
     _skip_if_no_container
     local out
-    out=$(_container_run 'zsh --version')
-    assert_matches "zsh" "$out" "zsh should be present"
+    out=$(_container_run 'brush --version')
+    assert_matches "brush" "$out" "brush should be present"
 }
 
 test_container_vju_t_present() {
