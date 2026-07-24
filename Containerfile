@@ -1,16 +1,17 @@
-# Containerfile-experimental
+# Containerfile
 #
-# Minimal distroless-style image: brush + tmux + vju-t + awsh/k8sh + awscli.
+# Minimal distroless-style image: brush + tmux + vju-t + awsh/k8sh/pyqdd + awscli.
 # No Debian, no Perl, no package manager in the final layer.
 #
 # Runtime base: alpine:3  (~5 MB, glibc-free, no Perl)
 # All Rust binaries are built as musl-static on rust:alpine.
 #
 # Build:
-#   podman build -f Containerfile-experimental -t klue:experimental .
+#   podman build -f Containerfile -t klue .
 #
 # brush: bash/POSIX-compatible shell in Rust  https://github.com/reubeno/brush
 # vju-t: terminal widget TUI               https://github.com/bbusse/vju-t
+# gojq:  pure-Go jq, installed as `jq`     https://github.com/itchyny/gojq
 
 # Clone vju-t using go-git (pure Go git — no system git binary needed).
 # Depth 0 = full history (go-git convention for unlimited).
@@ -25,18 +26,23 @@ RUN printf 'module clone\ngo 1.22\n' > go.mod \
     && mkdir -p /out \
     && /go-clone
 RUN git clone --branch dev --depth 1 https://github.com/bbusse/awsh.git /out/awsh \
-    && git clone --branch dev --depth 1 https://github.com/bbusse/k8sh.git /out/k8sh
+    && git clone --branch dev --depth 1 https://github.com/bbusse/k8sh.git /out/k8sh \
+    && git clone --branch dev --depth 1 https://github.com/bbusse/pyqdd.git /out/pyqdd \
+    && rm -rf /out/pyqdd/.git /out/pyqdd/Containerfile
 RUN go install github.com/jiro4989/textimg/v3@latest
+# gojq: pure-Go jq implementation, avoids pulling in C jq + its libs.
+RUN go install github.com/itchyny/gojq/cmd/gojq@latest
 # kubectl is a static Go binary; GOARCH already matches the release URL scheme.
 RUN ARCH=$(go env GOARCH) \
     && curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl" \
          -o /out/kubectl \
     && chmod +x /out/kubectl
 
-# Install awscli into a --target prefix so there is no Python-version
-# dependency on the path (packages land directly in /opt/pyqdd/).
+# Install awscli and pyqdd's dependency into a --target prefix so there is
+# no Python-version dependency on the path (packages land directly in
+# /opt/pyqdd/, which is also where the pyqdd scripts' PYTHONPATH points).
 FROM python:3-alpine AS pyqdd-exp-builder
-RUN pip install --no-cache-dir --target /opt/pyqdd awscli \
+RUN pip install --no-cache-dir --target /opt/pyqdd awscli 'datadog-api-client>=2.0.0' \
     && rm -rf /opt/pyqdd/awscli/examples /opt/pyqdd/awscli/topics \
     && find /opt/pyqdd -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null; true
 
@@ -62,9 +68,11 @@ RUN apk add --no-cache tmux python3 py3-pillow ttf-dejavu \
 COPY --from=brush-builder /usr/local/cargo/bin/brush /usr/local/bin/brush
 COPY --from=brush-builder /build/vju-t/target/release/vju-t /usr/local/bin/vju-t
 COPY --from=vju-t-source /go/bin/textimg /usr/local/bin/textimg
+COPY --from=vju-t-source /go/bin/gojq /usr/local/bin/jq
 COPY --from=vju-t-source /out/kubectl /usr/local/bin/kubectl
 COPY --from=vju-t-source /out/awsh /usr/local/src/awsh
 COPY --from=vju-t-source /out/k8sh /usr/local/src/k8sh
+COPY --from=vju-t-source /out/pyqdd /usr/local/src/pyqdd
 COPY --from=pyqdd-exp-builder /opt/pyqdd /opt/pyqdd
 COPY klue /usr/local/bin/klue
 RUN ln -s /usr/local/bin/brush /usr/local/bin/bash \
