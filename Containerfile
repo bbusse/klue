@@ -79,7 +79,7 @@ RUN ln -s /usr/local/bin/brush /usr/local/bin/bash \
     && printf '#!/usr/bin/env python3\nimport sys\nsys.path.insert(0, "/opt/pyqdd")\nfrom awscli.clidriver import main\nsys.exit(main())\n' > /usr/local/bin/aws \
     && chmod +x /usr/local/bin/aws
 
-RUN printf 'export PATH="/usr/local/bin:/usr/local/src/awsh:$PATH"\nexport PYTHONPATH="/opt/pyqdd"\n' \
+RUN printf 'export PATH="/usr/local/bin:/usr/local/src/awsh:$PATH"\nexport PYTHONPATH="/opt/pyqdd"\nif [[ -f /usr/local/src/k8sh/k8sh ]]; then\n    source /usr/local/src/k8sh/k8sh\nfi\n' \
         > /home/klue/.brushrc \
     && chown klue:klue /home/klue/.brushrc
 
