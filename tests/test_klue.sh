@@ -212,7 +212,7 @@ test_stream_serves_valid_jpeg_frames() {
     assert "wait_for_http_200 20" "stream endpoint should become available"
 
     # Grab a chunk of the stream
-    timeout 3 curl -s http://localhost:5999/stream > /tmp/klue_test_stream.bin 2>/dev/null || true
+    timeout 3 curl -s http://localhost:5999/stream >/tmp/klue_test_stream.bin 2>/dev/null || true
 
     # Verify MJPEG boundary format
     local has_boundary
@@ -280,8 +280,8 @@ test_no_suspension_with_multiple_panes() {
 
     # Add panes and send the same command klue would send: stty -tostop first
     for i in $(seq 1 $((n - 1))); do
-        tmux split-window -t "$sess:$win" -h 2>/dev/null \
-            || tmux split-window -t "$sess:$win" -v 2>/dev/null || true
+        tmux split-window -t "$sess:$win" -h 2>/dev/null ||
+            tmux split-window -t "$sess:$win" -v 2>/dev/null || true
     done
     tmux select-layout -t "$sess:$win" tiled 2>/dev/null || true
 
@@ -388,11 +388,11 @@ test_send_keys_uses_literal_flag() {
     # Key names like 'Enter' do not need -l and are excluded by checking only
     # the last token on each line.
     local bare_send_keys
-    bare_send_keys=$(grep 'send-keys' "$KLUE" \
-        | grep -v -- '-l' \
-        | grep -v '^[[:space:]]*#' \
-        | awk 'NF>0 { last=$NF; if (last ~ /["\$]/) print }' \
-        || true)
+    bare_send_keys=$(grep 'send-keys' "$KLUE" |
+        grep -v -- '-l' |
+        grep -v '^[[:space:]]*#' |
+        awk 'NF>0 { last=$NF; if (last ~ /["\$]/) print }' ||
+        true)
     assert_equals "" "$bare_send_keys" \
         "found send-keys without -l flag (causes copy-mode): $bare_send_keys"
 }
@@ -424,8 +424,8 @@ _skip_if_no_container() {
     if [[ -z "$runtime" ]]; then
         skip "no container runtime (podman/docker) available"
     fi
-    if ! "$runtime" image exists "$CONTAINER_IMAGE" 2>/dev/null \
-       && ! "$runtime" inspect "$CONTAINER_IMAGE" >/dev/null 2>&1; then
+    if ! "$runtime" image exists "$CONTAINER_IMAGE" 2>/dev/null &&
+        ! "$runtime" inspect "$CONTAINER_IMAGE" >/dev/null 2>&1; then
         skip "container image '$CONTAINER_IMAGE' not found — build it first"
     fi
 }
@@ -465,7 +465,7 @@ test_container_jq_works() {
     _skip_if_no_container
     local out
     out=$(_container_run 'jq --version')
-    assert_matches "jq-" "$out" "jq --version should print version string"
+    assert_matches "gojq" "$out" "jq --version should print version string"
 }
 
 test_container_kubectl_present() {
@@ -659,7 +659,8 @@ test_container_stream_stays_alive() {
         "streaming container should survive exec+detach (was: $status)"
 }
 
-test_container_stream_http_200() {    _skip_if_no_container
+test_container_stream_http_200() {
+    _skip_if_no_container
 
     local runtime stream_port container_id
     runtime=$(_container_runtime)
