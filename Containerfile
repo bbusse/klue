@@ -1,10 +1,10 @@
 # Containerfile
 #
-# Minimal distroless-style image: brush + tmux + vju-t + awsh/k8sh/pyqdd + awscli.
-# No Debian, no Perl, no package manager in the final layer.
+# Minimal distroless-style image: brush + tmux + vju-t + awsh/k8sh/pyqdd + awscli
+# No Debian, no Perl, no package manager in the final layer
 #
 # Runtime base: alpine:3  (~5 MB, glibc-free, no Perl)
-# All Rust binaries are built as musl-static on rust:alpine.
+# All Rust binaries are built as musl-static on rust:alpine
 #
 # Build:
 #   podman build -f Containerfile -t klue .
@@ -13,20 +13,13 @@
 # git-clone layers are cached by instruction text, not remote state):
 #   podman build --build-arg GIT_CLONE_CACHE_BUST=$(date +%s) -f Containerfile -t klue .
 #
-# brush: bash/POSIX-compatible shell in Rust  https://github.com/reubeno/brush
-# vju-t: terminal widget TUI               https://github.com/bbusse/vju-t
-# gojq:  pure-Go jq, installed as `jq`     https://github.com/itchyny/gojq
-
-# Clone vju-t using go-git (pure Go git — no system git binary needed).
+# Clone vju-t using go-git (pure Go git — no system git binary needed)
 # Depth 0 = full history (go-git convention for unlimited).
 FROM golang:1-alpine AS vju-t-source
 RUN apk add --no-cache ca-certificates git curl
 WORKDIR /app
 
-# `git clone`/go-git RUN layers below are cached by instruction TEXT, not by
-# what's actually on the remote branch — podman has no way to know the dev
-# branches of vju-t/awsh/k8sh/pyqdd moved forward, so a plain rebuild silently
-# reuses stale clones forever. Bump this to force fresh clones without
+# Bump this to force fresh clones without
 # discarding the (slow) Rust build cache below:
 #   podman build --build-arg GIT_CLONE_CACHE_BUST=$(date +%s) -f Containerfile -t klue .
 ARG GIT_CLONE_CACHE_BUST=1
@@ -40,7 +33,7 @@ RUN echo "$GIT_CLONE_CACHE_BUST" >/dev/null \
     && mkdir -p /out \
     && /go-clone
 # Split into one RUN per repo (not chained with &&) so a change to one
-# clone's cache-bust or command doesn't force-invalidate the others' cache.
+# clone's cache-bust or command doesn't force-invalidate the others' cache
 RUN echo "$GIT_CLONE_CACHE_BUST" >/dev/null \
     && git clone --branch dev --depth 1 https://github.com/bbusse/awsh.git /out/awsh
 RUN echo "$GIT_CLONE_CACHE_BUST" >/dev/null \
@@ -48,9 +41,13 @@ RUN echo "$GIT_CLONE_CACHE_BUST" >/dev/null \
 RUN echo "$GIT_CLONE_CACHE_BUST" >/dev/null \
     && git clone --branch dev --depth 1 https://github.com/bbusse/pyqdd.git /out/pyqdd \
     && rm -rf /out/pyqdd/.git /out/pyqdd/Containerfile
-RUN go install github.com/jiro4989/textimg/v3@latest
+# -ldflags="-s -w" strips debug symbols/DWARF info before UPX compresses
+# these below; UPX doesn't remove them on its own (verified: ~30% smaller
+# pre-UPX, and that reduction compounds through UPX rather than being
+# subsumed by it).
+RUN GOFLAGS="-ldflags=-s -w" go install github.com/jiro4989/textimg/v3@latest
 # gojq: pure-Go jq implementation, avoids pulling in C jq + its libs.
-RUN go install github.com/itchyny/gojq/cmd/gojq@latest
+RUN GOFLAGS="-ldflags=-s -w" go install github.com/itchyny/gojq/cmd/gojq@latest
 # kubectl is a static Go binary; GOARCH already matches the release URL scheme.
 RUN ARCH=$(go env GOARCH) \
     && curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl" \
@@ -76,20 +73,35 @@ RUN cd /build/vju-t \
     && cargo build --jobs 1 --release \
     && strip target/release/vju-t
 
+# UPX-compress the 5 binaries (~56MB combined savings, verified: they still
+# run correctly post-compression) and isolate just the one DejaVu font file
+# klue actually uses (STREAM_FONT), rather than installing the whole family
+# + its fontconfig/X11 transitive deps (~13MB) into the runtime image.
+# Everything here is discarded except what's explicitly COPY'd out below.
+FROM alpine:3 AS artifact-compressor
+RUN apk add --no-cache upx font-dejavu
+COPY --from=vju-t-source /out/kubectl /work/kubectl
+COPY --from=vju-t-source /go/bin/textimg /work/textimg
+COPY --from=vju-t-source /go/bin/gojq /work/jq
+COPY --from=brush-builder /build/vju-t/target/release/vju-t /work/vju-t
+COPY --from=brush-builder /usr/local/cargo/bin/brush /work/brush
+RUN upx --best --lzma /work/kubectl /work/textimg /work/jq /work/vju-t /work/brush
+
 # Final image: Alpine + tmux + python3 + Pillow + brush.
 FROM alpine:3
-RUN apk add --no-cache tmux python3 py3-pillow ttf-dejavu \
+RUN apk add --no-cache tmux python3 py3-pillow \
     && addgroup -g 10001 klue \
     && adduser -D -h /home/klue -s /usr/local/bin/klue-shell -u 10001 -G klue klue \
     && echo '/usr/local/bin/brush' >> /etc/shells \
     && echo '/usr/local/bin/klue-shell' >> /etc/shells \
-    && mkdir -p /home/klue /etc/klue \
+    && mkdir -p /home/klue /etc/klue /usr/share/fonts/dejavu \
     && chown -R klue:klue /home/klue /etc/klue
-COPY --from=brush-builder /usr/local/cargo/bin/brush /usr/local/bin/brush
-COPY --from=brush-builder /build/vju-t/target/release/vju-t /usr/local/bin/vju-t
-COPY --from=vju-t-source /go/bin/textimg /usr/local/bin/textimg
-COPY --from=vju-t-source /go/bin/gojq /usr/local/bin/jq
-COPY --from=vju-t-source /out/kubectl /usr/local/bin/kubectl
+COPY --from=artifact-compressor /work/brush /usr/local/bin/brush
+COPY --from=artifact-compressor /work/vju-t /usr/local/bin/vju-t
+COPY --from=artifact-compressor /work/textimg /usr/local/bin/textimg
+COPY --from=artifact-compressor /work/jq /usr/local/bin/jq
+COPY --from=artifact-compressor /work/kubectl /usr/local/bin/kubectl
+COPY --from=artifact-compressor /usr/share/fonts/dejavu/DejaVuSansMono.ttf /usr/share/fonts/dejavu/DejaVuSansMono.ttf
 COPY --from=vju-t-source /out/awsh /usr/local/src/awsh
 COPY --from=vju-t-source /out/k8sh /usr/local/src/k8sh
 COPY --from=vju-t-source /out/pyqdd /usr/local/src/pyqdd
