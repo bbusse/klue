@@ -9,6 +9,10 @@
 # Build:
 #   podman build -f Containerfile -t klue .
 #
+# To pick up upstream changes to vju-t/awsh/k8sh/pyqdd's dev branches (their
+# git-clone layers are cached by instruction text, not remote state):
+#   podman build --build-arg GIT_CLONE_CACHE_BUST=$(date +%s) -f Containerfile -t klue .
+#
 # brush: bash/POSIX-compatible shell in Rust  https://github.com/reubeno/brush
 # vju-t: terminal widget TUI               https://github.com/bbusse/vju-t
 # gojq:  pure-Go jq, installed as `jq`     https://github.com/itchyny/gojq
@@ -18,15 +22,30 @@
 FROM golang:1-alpine AS vju-t-source
 RUN apk add --no-cache ca-certificates git curl
 WORKDIR /app
-RUN printf 'module clone\ngo 1.22\n' > go.mod \
+
+# `git clone`/go-git RUN layers below are cached by instruction TEXT, not by
+# what's actually on the remote branch — podman has no way to know the dev
+# branches of vju-t/awsh/k8sh/pyqdd moved forward, so a plain rebuild silently
+# reuses stale clones forever. Bump this to force fresh clones without
+# discarding the (slow) Rust build cache below:
+#   podman build --build-arg GIT_CLONE_CACHE_BUST=$(date +%s) -f Containerfile -t klue .
+ARG GIT_CLONE_CACHE_BUST=1
+
+RUN echo "$GIT_CLONE_CACHE_BUST" >/dev/null \
+    && printf 'module clone\ngo 1.22\n' > go.mod \
     && printf 'package main\n\nimport (\n\t"log"\n\tgit "github.com/go-git/go-git/v5"\n\t"github.com/go-git/go-git/v5/plumbing"\n)\n\nfunc main() {\n\t_, err := git.PlainClone("/out/vju-t", false, &git.CloneOptions{\n\t\tURL:           "https://github.com/bbusse/vju-t.git",\n\t\tReferenceName: plumbing.NewBranchReferenceName("dev"),\n\t})\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n' > main.go \
     && go get github.com/go-git/go-git/v5 \
     && go mod tidy \
     && go build -o /go-clone . \
     && mkdir -p /out \
     && /go-clone
-RUN git clone --branch dev --depth 1 https://github.com/bbusse/awsh.git /out/awsh \
-    && git clone --branch dev --depth 1 https://github.com/bbusse/k8sh.git /out/k8sh \
+# Split into one RUN per repo (not chained with &&) so a change to one
+# clone's cache-bust or command doesn't force-invalidate the others' cache.
+RUN echo "$GIT_CLONE_CACHE_BUST" >/dev/null \
+    && git clone --branch dev --depth 1 https://github.com/bbusse/awsh.git /out/awsh
+RUN echo "$GIT_CLONE_CACHE_BUST" >/dev/null \
+    && git clone --branch dev --depth 1 https://github.com/bbusse/k8sh.git /out/k8sh
+RUN echo "$GIT_CLONE_CACHE_BUST" >/dev/null \
     && git clone --branch dev --depth 1 https://github.com/bbusse/pyqdd.git /out/pyqdd \
     && rm -rf /out/pyqdd/.git /out/pyqdd/Containerfile
 RUN go install github.com/jiro4989/textimg/v3@latest
@@ -75,7 +94,6 @@ COPY --from=vju-t-source /out/awsh /usr/local/src/awsh
 COPY --from=vju-t-source /out/k8sh /usr/local/src/k8sh
 COPY --from=vju-t-source /out/pyqdd /usr/local/src/pyqdd
 COPY --from=pyqdd-exp-builder /opt/pyqdd /opt/pyqdd
-COPY klue /usr/local/bin/klue
 RUN ln -s /usr/local/bin/brush /usr/local/bin/bash \
     && printf '#!/usr/bin/env python3\nimport sys\nsys.path.insert(0, "/opt/pyqdd")\nfrom awscli.clidriver import main\nsys.exit(main())\n' > /usr/local/bin/aws \
     && chmod +x /usr/local/bin/aws \
@@ -85,6 +103,11 @@ RUN ln -s /usr/local/bin/brush /usr/local/bin/bash \
 RUN printf 'export PATH="/usr/local/bin:/usr/local/src/awsh:$PATH"\nexport PYTHONPATH="/opt/pyqdd"\nif [[ -f /usr/local/src/k8sh/k8sh ]]; then\n    source /usr/local/src/k8sh/k8sh\nfi\n' \
         > /home/klue/.brushrc \
     && chown klue:klue /home/klue/.brushrc
+
+# Copied last: klue itself changes far more often than anything above it, so
+# this keeps those (cheap, but still layer-cache-sequential) RUN steps from
+# needlessly re-running on every klue edit.
+COPY klue /usr/local/bin/klue
 
 ENV SHELL=/usr/local/bin/klue-shell
 ENV PYTHONPATH=/opt/pyqdd
