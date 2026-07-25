@@ -611,8 +611,11 @@ def render_loop():
 # Start render thread
 threading.Thread(target=render_loop, daemon=True).start()
 
-# Wait for first frame
-time.sleep(2)
+# Wait for the first frame, bounded so a stalled render loop can't hang
+# startup indefinitely.
+_frame_wait_deadline = time.time() + 5
+while not current_frame and time.time() < _frame_wait_deadline:
+    time.sleep(0.05)
 
 # Start HTTP server
 socketserver.TCPServer.allow_reuse_address = True
