@@ -70,17 +70,26 @@ run_klue_bg() {
     done
 
     # Force adequate dimensions for tests regardless of the current terminal.
+    #
+    # Every branch redirects the backgrounded job's own stdout/stderr away
+    # (to a log file, not /dev/null, so failures are still debuggable):
+    # callers capture this function's PID via `pid=$(run_klue_bg ...)`, and
+    # command substitution doesn't return until EVERY writer of that pipe
+    # closes it — not just after `echo $!`. Without the redirect, klue's own
+    # (indefinitely long-running) output keeps the pipe open, so `$(...)`
+    # hangs forever instead of returning the PID immediately.
+    local bg_log="${TMPDIR:-/tmp}/klue-test-bg-$$-${RANDOM}.log"
     if script --version 2>&1 | grep -q 'GNU\|util-linux'; then
         # GNU script: set pty cols/rows via stty so tmux attach doesn't reflow
         TERM="xterm-256color" COLUMNS="$cols" LINES="50" \
-            script -qefc "stty cols $cols rows 50 2>/dev/null; $cmd" /dev/null &
+            script -qefc "stty cols $cols rows 50 2>/dev/null; $cmd" /dev/null >"$bg_log" 2>&1 &
     elif command -v script >/dev/null 2>&1; then
         # BSD script (macOS): same stty trick inside the subshell
         TERM="xterm-256color" COLUMNS="$cols" LINES="50" \
-            script -q /dev/null bash -c "stty cols $cols rows 50 2>/dev/null; $cmd" &
+            script -q /dev/null bash -c "stty cols $cols rows 50 2>/dev/null; $cmd" >"$bg_log" 2>&1 &
     else
         TERM="xterm-256color" COLUMNS="$cols" LINES="50" \
-            bash "$KLUE" "${args[@]}" &
+            bash "$KLUE" "${args[@]}" >"$bg_log" 2>&1 &
     fi
 
     echo $!
@@ -187,11 +196,36 @@ test_stream_starts_http_server() {
     http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5999/)
     assert_equals "200" "$http_code" "HTTP server should respond 200 on /"
 
+    # / is a browser landing page, not the stream itself — check its actual
+    # content, not just its status code. This is what would have caught the
+    # confusion of pointing mpv/ffmpeg at / instead of /stream: if this page
+    # ever stopped pointing at /stream, a status-code-only check wouldn't
+    # notice.
+    local index_content_type index_body
+    index_content_type=$(curl -s -D - -o /dev/null http://localhost:5999/ | tr -d '\r' | grep -i '^Content-Type:')
+    assert_matches "text/html" "$index_content_type" \
+        "/ should be served as text/html (got: $index_content_type)"
+    index_body=$(curl -s http://localhost:5999/)
+    assert_matches 'src="/stream"' "$index_body" \
+        "/ should embed an <img> pointing at /stream (got: $index_body)"
+
+    # /stream is the raw MJPEG feed clients like mpv/ffmpeg/curl consume
+    # directly — check its Content-Type header, not just that bytes flow.
+    local stream_content_type
+    stream_content_type=$(curl -s -D - -o /dev/null --max-time 2 http://localhost:5999/stream | tr -d '\r' | grep -i '^Content-Type:')
+    assert_matches "multipart/x-mixed-replace" "$stream_content_type" \
+        "/stream should be served as multipart/x-mixed-replace (got: $stream_content_type)"
+
     # Check MJPEG stream delivers data
     local bytes
     bytes=$(timeout 3 curl -s http://localhost:5999/stream | wc -c | tr -d ' ')
     assert "test $bytes -gt 1000" \
         "MJPEG stream should deliver data (got $bytes bytes)"
+
+    # Unknown paths should 404, not silently serve the index or the stream.
+    local notfound_code
+    notfound_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5999/nonexistent)
+    assert_equals "404" "$notfound_code" "unknown paths should 404 (got: $notfound_code)"
 
     kill "$stream_pid" 2>/dev/null
     wait "$stream_pid" 2>/dev/null || true
