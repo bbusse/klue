@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-#export CONTAINER="ghcr.io/bbusse/klue:latest"
-CONTAINER="${CONTAINER:-klue}"
+export CONTAINER="ghcr.io/bbusse/klue:latest"
+#CONTAINER="${CONTAINER:-klue}"
 readonly CONTAINER
 export VERBOSE=1
 readonly VERBOSE
@@ -72,13 +72,22 @@ if [[ -z "${DD_APP_KEY:-}" ]]; then
     exit 1
 fi
 
+# klue is a single-instance personal dashboard: if a container from this
+# image is already running, starting a second one would fail outright
+# anyway (fixed STREAM_PORT publish -> "proxy already running"). Re-attach
+# to it instead of erroring.
+EXISTING_CONTAINER_ID=$("${executor}" ps --filter "ancestor=${CONTAINER}" --filter "status=running" --format '{{.ID}}' | head -1)
+readonly EXISTING_CONTAINER_ID
+
 MOUNT_CONFIG_PATH="${CONFIG_PATH}"
 TEMP_CONFIG_COPY=""
 TEMP_AWS_CACHE_DIR=""
 
 # Podman on macOS can only mount paths shared with the Podman VM (HOME is shared by default).
 # If user passes a config from an unshared path (e.g. /usr/local/src), stage a read-only copy under HOME.
-if [[ "${executor}" == "podman" && "${CONFIG_PATH}" != "${HOME}"/* ]]; then
+# Not needed when re-attaching: the existing container already has its own
+# config mounted from whenever it was started.
+if [[ -z "${EXISTING_CONTAINER_ID}" && "${executor}" == "podman" && "${CONFIG_PATH}" != "${HOME}"/* ]]; then
     TEMP_CONFIG_COPY="${HOME}/.klue-config.$(date +%s).$$.toml"
     cp "${CONFIG_PATH}" "${TEMP_CONFIG_COPY}"
     MOUNT_CONFIG_PATH="${TEMP_CONFIG_COPY}"
@@ -116,89 +125,101 @@ cleanup() {
 }
 trap cleanup EXIT
 
-CONTAINER_KUBECONFIG=""
-if [[ -n "${HOST_KUBECONFIG}" ]]; then
-    IFS=':' read -r -a kubeconfig_parts <<<"${HOST_KUBECONFIG}"
-    for kubeconfig_part in "${kubeconfig_parts[@]}"; do
-        mapped_part="${kubeconfig_part}"
-        if [[ "${kubeconfig_part}" == "${HOME}"/* ]]; then
-            mapped_part="${CONTAINER_HOME}/${kubeconfig_part#"${HOME}/"}"
-        fi
-
-        if [[ -z "${CONTAINER_KUBECONFIG}" ]]; then
-            CONTAINER_KUBECONFIG="${mapped_part}"
-        else
-            CONTAINER_KUBECONFIG="${CONTAINER_KUBECONFIG}:${mapped_part}"
-        fi
-    done
-fi
-
-args=(
-    run
-    -e "AWS_PROFILE=${AWS_PROFILE}"
-    -e "AWS_REGION=${AWS_REGION}"
-    -e DD_API_KEY
-    -e DD_APP_KEY
-    -v "${MOUNT_CONFIG_PATH}:/config.toml:ro"
-    -v "${HOME}/.kube:${CONTAINER_HOME}/.kube:ro"
-    -v "${HOME}/.aws:${CONTAINER_HOME}/.aws:ro"
-)
-
-TEMP_AWS_CACHE_DIR="${HOME}/.klue-aws-cache.$(date +%s).$$"
-mkdir -p "${TEMP_AWS_CACHE_DIR}"
-args+=(-v "${TEMP_AWS_CACHE_DIR}:${CONTAINER_HOME}/.aws/cli/cache:rw")
-
 container_term="${TERM:-xterm-256color}"
 if ! "${executor}" run --rm --entrypoint sh "${CONTAINER}" -lc "infocmp '${container_term}' >/dev/null 2>&1"; then
     log "Terminal '${container_term}' not available in container terminfo, falling back to xterm-256color"
     container_term="xterm-256color"
 fi
-args+=(-e "TERM=${container_term}")
 
-for passthrough_var in COLORTERM LANG LC_ALL LC_CTYPE; do
-    if [[ -n "${!passthrough_var:-}" ]]; then
-        args+=(-e "${passthrough_var}=${!passthrough_var}")
+if [[ -n "${EXISTING_CONTAINER_ID}" ]]; then
+    container_id="${EXISTING_CONTAINER_ID}"
+    CONTAINER_ID_LIVE="$container_id"
+    log "Found running container: ${container_id:0:12}, re-attaching instead of starting a new one"
+    if [[ "${STREAM}" == "true" ]]; then
+        log "Stream:    http://localhost:${STREAM_PORT}/        (open in a browser)"
+        log "           http://localhost:${STREAM_PORT}/stream (mpv/ffmpeg/curl — raw MJPEG feed)"
     fi
-done
+else
+    CONTAINER_KUBECONFIG=""
+    if [[ -n "${HOST_KUBECONFIG}" ]]; then
+        IFS=':' read -r -a kubeconfig_parts <<<"${HOST_KUBECONFIG}"
+        for kubeconfig_part in "${kubeconfig_parts[@]}"; do
+            mapped_part="${kubeconfig_part}"
+            if [[ "${kubeconfig_part}" == "${HOME}"/* ]]; then
+                mapped_part="${CONTAINER_HOME}/${kubeconfig_part#"${HOME}/"}"
+            fi
 
-if [[ -n "${CONTAINER_KUBECONFIG}" ]]; then
-    args+=(-e "KUBECONFIG=${CONTAINER_KUBECONFIG}")
+            if [[ -z "${CONTAINER_KUBECONFIG}" ]]; then
+                CONTAINER_KUBECONFIG="${mapped_part}"
+            else
+                CONTAINER_KUBECONFIG="${CONTAINER_KUBECONFIG}:${mapped_part}"
+            fi
+        done
+    fi
+
+    args=(
+        run
+        -e "AWS_PROFILE=${AWS_PROFILE}"
+        -e "AWS_REGION=${AWS_REGION}"
+        -e DD_API_KEY
+        -e DD_APP_KEY
+        -v "${MOUNT_CONFIG_PATH}:/config.toml:ro"
+        -v "${HOME}/.kube:${CONTAINER_HOME}/.kube:ro"
+        -v "${HOME}/.aws:${CONTAINER_HOME}/.aws:ro"
+    )
+
+    TEMP_AWS_CACHE_DIR="${HOME}/.klue-aws-cache.$(date +%s).$$"
+    mkdir -p "${TEMP_AWS_CACHE_DIR}"
+    args+=(-v "${TEMP_AWS_CACHE_DIR}:${CONTAINER_HOME}/.aws/cli/cache:rw")
+
+    args+=(-e "TERM=${container_term}")
+
+    for passthrough_var in COLORTERM LANG LC_ALL LC_CTYPE; do
+        if [[ -n "${!passthrough_var:-}" ]]; then
+            args+=(-e "${passthrough_var}=${!passthrough_var}")
+        fi
+    done
+
+    if [[ -n "${CONTAINER_KUBECONFIG}" ]]; then
+        args+=(-e "KUBECONFIG=${CONTAINER_KUBECONFIG}")
+    fi
+
+    if [[ -n "${CONTAINER_PLATFORM}" ]]; then
+        args+=(--platform "${CONTAINER_PLATFORM}")
+    fi
+
+    if [[ -d "${HOME}/.aws/sso" ]]; then
+        args+=(-v "${HOME}/.aws/sso:${CONTAINER_HOME}/.aws/sso:ro")
+    fi
+
+    # Always run detached so the container persists after detach.
+    # No --rm: we do explicit cleanup in cleanup() with post-mortem logging.
+    args+=(-d)
+
+    if [[ "${STREAM}" == "true" ]]; then
+        args+=(-p "${STREAM_PORT}:${STREAM_PORT}")
+    fi
+
+    args+=(
+        --entrypoint /usr/local/bin/klue
+        "${CONTAINER}"
+        --config /config.toml
+    )
+
+    if [[ "${STREAM}" == "true" ]]; then
+        args+=(--stream --stream-port "${STREAM_PORT}"
+            --stream-font "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
+    fi
+
+    container_id=$("${executor}" "${args[@]}")
+    CONTAINER_ID_LIVE="$container_id"
+    log "Container: ${container_id:0:12}"
+    if [[ "${STREAM}" == "true" ]]; then
+        log "Stream:    http://localhost:${STREAM_PORT}/        (open in a browser)"
+        log "           http://localhost:${STREAM_PORT}/stream (mpv/ffmpeg/curl — raw MJPEG feed)"
+    fi
+    log "Stop:      ${executor} rm -f ${container_id:0:12}"
 fi
-
-if [[ -n "${CONTAINER_PLATFORM}" ]]; then
-    args+=(--platform "${CONTAINER_PLATFORM}")
-fi
-
-if [[ -d "${HOME}/.aws/sso" ]]; then
-    args+=(-v "${HOME}/.aws/sso:${CONTAINER_HOME}/.aws/sso:ro")
-fi
-
-# Always run detached so the container persists after detach.
-# No --rm: we do explicit cleanup in cleanup() with post-mortem logging.
-args+=(-d)
-
-if [[ "${STREAM}" == "true" ]]; then
-    args+=(-p "${STREAM_PORT}:${STREAM_PORT}")
-fi
-
-args+=(
-    --entrypoint /usr/local/bin/klue
-    "${CONTAINER}"
-    --config /config.toml
-)
-
-if [[ "${STREAM}" == "true" ]]; then
-    args+=(--stream --stream-port "${STREAM_PORT}" \
-           --stream-font "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
-fi
-
-container_id=$("${executor}" "${args[@]}")
-CONTAINER_ID_LIVE="$container_id"
-log "Container: ${container_id:0:12}"
-if [[ "${STREAM}" == "true" ]]; then
-    log "Stream:    http://localhost:${STREAM_PORT}/"
-fi
-log "Stop:      ${executor} rm -f ${container_id:0:12}"
 
 # Follow container logs to a temp file so they survive --rm.
 CONTAINER_LOG="${HOME}/.klue-container-${container_id:0:12}.log"
