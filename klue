@@ -473,11 +473,26 @@ if [[ "$STREAM" == true ]]; then
     FRAME_TMPDIR=$(mktemp -d)
     trap 'rm -rf "$FRAME_TMPDIR"' EXIT
 
-    # Capture one frame to detect cell size and canvas dimensions
-    tmux capture-pane -t "$SESSION:$WINDOW.0" -p -e |
-        "$TEXTIMG" -f "$STREAM_FONT" -F "$STREAM_FONTSIZE" -o "$FRAME_TMPDIR/probe.png" 2>/dev/null
+    # Capture one frame to detect cell size and canvas dimensions.
+    #
+    # When reattaching to a just-created session (the has-session branch
+    # above), panes can still be blank for the first moments — textimg
+    # rejects blank input ("must need input texts"), and under `set -e
+    # -o pipefail` that failure would otherwise kill this script silently,
+    # before the informative error below ever runs. Retry briefly: pane
+    # content (even just a shell prompt) normally appears within
+    # milliseconds.
+    probe_ok=false
+    for _ in $(seq 1 25); do
+        if tmux capture-pane -t "$SESSION:$WINDOW.0" -p -e |
+            "$TEXTIMG" -f "$STREAM_FONT" -F "$STREAM_FONTSIZE" -o "$FRAME_TMPDIR/probe.png" 2>/dev/null; then
+            probe_ok=true
+            break
+        fi
+        sleep 0.2
+    done
 
-    if [[ ! -f "$FRAME_TMPDIR/probe.png" ]]; then
+    if [[ "$probe_ok" != true || ! -f "$FRAME_TMPDIR/probe.png" ]]; then
         echo "Error: textimg probe failed — font='$STREAM_FONT' size=$STREAM_FONTSIZE" >&2
         echo "  Check font path and that the tmux session has at least one pane." >&2
         exit 1
